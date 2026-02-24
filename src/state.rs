@@ -12,6 +12,12 @@ pub enum ApplyResult {
     RequiresRefutation(NodeId),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerEligibleSnapshot {
+    pub view_epoch: ViewEpoch,
+    pub members: Vec<MemberRecord>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MembershipStore {
     members: HashMap<NodeId, MemberRecord>,
@@ -120,6 +126,14 @@ impl MembershipStore {
     }
 
     #[must_use]
+    pub fn snapshot_owner_eligible_with_epoch(&self, now_ms: u64) -> OwnerEligibleSnapshot {
+        OwnerEligibleSnapshot {
+            view_epoch: self.view_epoch,
+            members: self.snapshot_owner_eligible(now_ms),
+        }
+    }
+
+    #[must_use]
     pub fn digest(&self) -> Vec<MemberDigest> {
         let mut digest: Vec<_> = self
             .members
@@ -131,6 +145,18 @@ impl MembershipStore {
             .collect();
         digest.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         digest
+    }
+
+    #[must_use]
+    pub fn snapshot_members(&self) -> Vec<MemberRecord> {
+        let mut members: Vec<_> = self.members.values().cloned().collect();
+        members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        members
+    }
+
+    #[must_use]
+    pub const fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
     }
 
     #[must_use]
@@ -490,5 +516,37 @@ mod tests {
         assert_eq!(update.incarnation, 1);
         assert_eq!(update.status, MemberStatus::Alive);
         assert_eq!(store.view_epoch(), 1);
+    }
+
+    #[test]
+    fn owner_eligible_snapshot_returns_epoch_and_filtered_members() {
+        let mut store = MembershipStore::new(NodeId::from("local"), addr(9000), 1_000);
+
+        let _ = store.apply_update(
+            update("node-a", MemberStatus::Dead, 2, 5, "node-a", "node-b"),
+            10,
+        );
+        let _ = store.apply_update(
+            update("node-a", MemberStatus::Alive, 3, 11, "node-a", "node-c"),
+            11,
+        );
+
+        let snapshot_before = store.snapshot_owner_eligible_with_epoch(500);
+        assert_eq!(snapshot_before.view_epoch, store.view_epoch());
+        assert!(
+            snapshot_before
+                .members
+                .iter()
+                .all(|member| member.node_id != NodeId::from("node-a"))
+        );
+
+        let snapshot_after = store.snapshot_owner_eligible_with_epoch(1_500);
+        assert_eq!(snapshot_after.view_epoch, store.view_epoch());
+        assert!(
+            snapshot_after
+                .members
+                .iter()
+                .any(|member| member.node_id == NodeId::from("node-a"))
+        );
     }
 }

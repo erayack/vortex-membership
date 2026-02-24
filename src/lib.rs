@@ -1,13 +1,13 @@
+pub mod anti_entropy;
 pub mod config;
+pub mod dissemination;
 pub mod failure_detector;
+pub mod node;
+pub mod ownership;
 pub mod protocol;
 pub mod state;
 pub mod transport;
 pub mod types;
-pub mod dissemination {}
-pub mod anti_entropy {}
-pub mod ownership {}
-pub mod node {}
 pub mod harness {}
 pub mod report {}
 
