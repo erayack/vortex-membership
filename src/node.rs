@@ -507,17 +507,19 @@ impl NodeRuntime {
     }
 
     fn apply_and_track(&mut self, update: MembershipUpdate, now_ms: u64) {
-        if let ApplyResult::Applied { .. } = self.store.apply_update(update.clone(), now_ms) {
-            if let Some(observer) = &self.observer {
-                let _ = observer.send(NodeEvent::MembershipApplied {
-                    observer: self.local_node_id.clone(),
-                    update: update.clone(),
-                    view_epoch: self.store.view_epoch(),
-                    alive_members: self.store.snapshot_alive(),
-                    at_ms: now_ms,
-                });
+        match self.store.apply_update(update.clone(), now_ms) {
+            ApplyResult::Applied { .. } => {
+                self.emit_membership_applied(update.clone(), now_ms);
+                self.disseminator.enqueue(update);
+                self.sync_disseminator_cluster_size();
             }
-            self.disseminator.enqueue(update);
+            ApplyResult::RequiresRefutation(node_id) if node_id == self.local_node_id => {
+                let refutation = self.store.mark_local_alive_with_new_incarnation(now_ms);
+                self.emit_membership_applied(refutation.clone(), now_ms);
+                self.disseminator.enqueue(refutation);
+                self.sync_disseminator_cluster_size();
+            }
+            ApplyResult::IgnoredStale | ApplyResult::RequiresRefutation(_) => {}
         }
     }
 
@@ -526,6 +528,23 @@ impl NodeRuntime {
             .snapshot_members()
             .into_iter()
             .find_map(|member| (member.node_id == *node_id).then_some(member.addr))
+    }
+
+    fn emit_membership_applied(&self, update: MembershipUpdate, now_ms: u64) {
+        if let Some(observer) = &self.observer {
+            let _ = observer.send(NodeEvent::MembershipApplied {
+                observer: self.local_node_id.clone(),
+                update,
+                view_epoch: self.store.view_epoch(),
+                alive_members: self.store.snapshot_alive(),
+                at_ms: now_ms,
+            });
+        }
+    }
+
+    fn sync_disseminator_cluster_size(&mut self) {
+        let alive_count = self.store.snapshot_alive().len().max(1);
+        self.disseminator.set_cluster_size(alive_count);
     }
 }
 

@@ -34,15 +34,17 @@ impl OwnershipResolver {
             return Vec::new();
         }
 
-        let mut scored_nodes: Vec<_> = members
+        let mut alive_nodes: Vec<_> = members
             .iter()
             .filter(|member| member.status == MemberStatus::Alive)
-            .map(|member| {
-                (
-                    self.score_node(key, &member.node_id),
-                    member.node_id.clone(),
-                )
-            })
+            .map(|member| member.node_id.clone())
+            .collect();
+        alive_nodes.sort_unstable();
+        alive_nodes.dedup();
+
+        let mut scored_nodes: Vec<_> = alive_nodes
+            .into_iter()
+            .map(|node_id| (self.score_node(key, &node_id), node_id))
             .collect();
 
         scored_nodes.sort_unstable_by(|(left_score, left_id), (right_score, right_id)| {
@@ -144,5 +146,18 @@ mod tests {
         let top1 = resolver.top_k(b"key-a", &members, 1);
         let top3 = resolver.top_k(b"key-a", &members, 3);
         assert_eq!(top1[0], top3[0]);
+    }
+
+    #[test]
+    fn top_k_deduplicates_repeated_node_ids() {
+        let resolver = OwnershipResolver::default();
+        let members = vec![
+            member("node-a", MemberStatus::Alive, 1),
+            member("node-a", MemberStatus::Alive, 2),
+            member("node-b", MemberStatus::Alive, 1),
+        ];
+
+        let top = resolver.top_k(b"key-a", &members, 4);
+        assert_eq!(top.len(), 2);
     }
 }

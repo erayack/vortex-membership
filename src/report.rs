@@ -31,14 +31,14 @@ impl RunArtifact {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReportError {
-    #[error("failed to create artifact parent directory {path}: {source}")]
+    #[error("failed to create output parent directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("failed to serialize run artifact: {0}")]
+    #[error("failed to serialize JSON output: {0}")]
     Serialize(#[from] serde_json::Error),
-    #[error("failed to write run artifact at {path}: {source}")]
+    #[error("failed to write JSON output at {path}: {source}")]
     Write {
         path: PathBuf,
         source: std::io::Error,
@@ -52,6 +52,20 @@ pub enum ReportError {
 /// Returns [`ReportError`] if parent directory creation, serialization, or file
 /// writing fails.
 pub fn write_run_artifact(path: &Path, artifact: &RunArtifact) -> Result<(), ReportError> {
+    write_json_file(path, artifact)
+}
+
+/// Writes a pretty-printed run report JSON file to disk.
+///
+/// # Errors
+///
+/// Returns [`ReportError`] if parent directory creation, serialization, or file
+/// writing fails.
+pub fn write_run_report(path: &Path, report: &RunReport) -> Result<(), ReportError> {
+    write_json_file(path, report)
+}
+
+fn write_json_file<T: Serialize>(path: &Path, payload: &T) -> Result<(), ReportError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ReportError::CreateDir {
             path: parent.to_path_buf(),
@@ -59,8 +73,8 @@ pub fn write_run_artifact(path: &Path, artifact: &RunArtifact) -> Result<(), Rep
         })?;
     }
 
-    let payload = serde_json::to_string_pretty(artifact)?;
-    fs::write(path, payload).map_err(|source| ReportError::Write {
+    let serialized = serde_json::to_string_pretty(payload)?;
+    fs::write(path, serialized).map_err(|source| ReportError::Write {
         path: path.to_path_buf(),
         source,
     })
@@ -93,7 +107,9 @@ pub fn percentile(samples: &[u64], pct: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::percentile;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{RunReport, percentile, write_run_report};
 
     #[test]
     fn percentile_returns_zero_for_empty() {
@@ -105,5 +121,32 @@ mod tests {
         let samples = vec![100, 20, 40, 60, 80];
         assert_eq!(percentile(&samples, 0.5), 60);
         assert_eq!(percentile(&samples, 0.95), 100);
+    }
+
+    #[test]
+    fn write_run_report_writes_pretty_json_and_creates_parent_dirs() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        let root = std::env::temp_dir().join(format!("vortex-membership-report-{unique}"));
+        let out = root.join("nested").join("run-report.json");
+
+        let report = RunReport {
+            detection_p50_ms: 10,
+            detection_p95_ms: 20,
+            false_suspicions: 1,
+            convergence_ms: 30,
+            owner_churn_per_min: 2.5,
+        };
+        let write_result = write_run_report(&out, &report);
+        assert!(write_result.is_ok());
+
+        let read_result = std::fs::read_to_string(&out);
+        assert!(read_result.is_ok());
+        let payload = match read_result {
+            Ok(payload) => payload,
+            Err(error) => panic!("report file should exist: {error}"),
+        };
+        assert!(payload.contains("\n  \"detection_p50_ms\": 10"));
     }
 }

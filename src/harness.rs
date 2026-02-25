@@ -112,7 +112,10 @@ async fn spawn_nodes(
                 cfg.swim.indirect_ping_count,
                 cfg.swim.suspect_timeout_ms,
             ),
-            Disseminator::new(cfg.harness.node_count),
+            Disseminator::with_retransmit_multiplier(
+                cfg.harness.node_count,
+                cfg.swim.retransmit_multiplier,
+            ),
             OwnershipResolver::default(),
         )
         .with_observer(event_tx.clone());

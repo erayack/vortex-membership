@@ -7,6 +7,7 @@ use crate::transport::MAX_PACKET_SIZE;
 use crate::types::MembershipUpdate;
 
 const DEFAULT_RETRANSMIT_CONSTANT: usize = 1;
+const DEFAULT_RETRANSMIT_MULTIPLIER: f64 = 4.0;
 
 #[derive(Clone, Debug)]
 struct QueuedUpdate {
@@ -19,6 +20,7 @@ pub struct Disseminator {
     queue: VecDeque<QueuedUpdate>,
     cluster_size: usize,
     retransmit_constant: usize,
+    retransmit_multiplier: f64,
     remaining_budget_bytes: usize,
 }
 
@@ -29,7 +31,16 @@ impl Disseminator {
             queue: VecDeque::new(),
             cluster_size,
             retransmit_constant: DEFAULT_RETRANSMIT_CONSTANT,
+            retransmit_multiplier: DEFAULT_RETRANSMIT_MULTIPLIER,
             remaining_budget_bytes: MAX_PACKET_SIZE,
+        }
+    }
+
+    #[must_use]
+    pub fn with_retransmit_multiplier(cluster_size: usize, retransmit_multiplier: f64) -> Self {
+        Self {
+            retransmit_multiplier: normalize_retransmit_multiplier(retransmit_multiplier),
+            ..Self::new(cluster_size)
         }
     }
 
@@ -145,9 +156,24 @@ impl Disseminator {
         existing
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn retransmit_budget(&self) -> usize {
         let n = self.cluster_size.max(1);
-        log2_ceil(n).saturating_add(self.retransmit_constant).max(1)
+        let n_f64 = n as f64;
+        let swim_budget = if n <= 1 {
+            1
+        } else {
+            let scaled = self.retransmit_multiplier * n_f64.log10();
+            scaled.ceil() as usize
+        };
+        swim_budget
+            .saturating_add(self.retransmit_constant)
+            .saturating_sub(1)
+            .max(1)
     }
 }
 
@@ -157,20 +183,12 @@ fn encoded_update_len(update: &MembershipUpdate) -> usize {
         .map_or(MAX_PACKET_SIZE, |bytes| bytes.len())
 }
 
-const fn log2_ceil(n: usize) -> usize {
-    if n <= 1 {
-        return 0;
+fn normalize_retransmit_multiplier(multiplier: f64) -> f64 {
+    if multiplier.is_finite() && multiplier > 0.0 {
+        multiplier
+    } else {
+        DEFAULT_RETRANSMIT_MULTIPLIER
     }
-
-    let mut value = 1;
-    let mut power = 0;
-
-    while value < n {
-        value <<= 1;
-        power += 1;
-    }
-
-    power
 }
 
 #[cfg(test)]
@@ -221,6 +239,22 @@ mod tests {
         assert_eq!(third.len(), 1);
         assert_eq!(fourth.len(), 1);
         assert!(fifth.is_empty());
+    }
+
+    #[test]
+    fn retransmit_budget_scales_with_log10_cluster_size() {
+        let mut disseminator = Disseminator::with_retransmit_multiplier(10, 3.0);
+        disseminator.enqueue(update("node-a", 1));
+
+        let first = disseminator.next_piggyback_batch(1);
+        let second = disseminator.next_piggyback_batch(1);
+        let third = disseminator.next_piggyback_batch(1);
+        let fourth = disseminator.next_piggyback_batch(1);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(third.len(), 1);
+        assert!(fourth.is_empty());
     }
 
     #[test]

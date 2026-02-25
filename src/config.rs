@@ -1,7 +1,10 @@
 use std::fs;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::types::NodeId;
 
 const DEFAULT_PROBE_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_ACK_TIMEOUT_MS: u64 = 300;
@@ -9,11 +12,29 @@ const DEFAULT_INDIRECT_PING_COUNT: usize = 3;
 const DEFAULT_SUSPECT_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_QUARANTINE_MS: u64 = 60_000;
 const DEFAULT_ANTI_ENTROPY_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_RETRANSMIT_MULTIPLIER: f64 = 4.0;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub node: NodeConfig,
     pub swim: SwimConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodeConfig {
+    pub node_id: NodeId,
+    pub bind_addr: SocketAddr,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            node_id: NodeId::from("node-0"),
+            bind_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 15_000)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -88,6 +109,7 @@ pub struct SwimConfig {
     pub suspect_timeout_ms: u64,
     pub quarantine_ms: u64,
     pub anti_entropy_interval_ms: u64,
+    pub retransmit_multiplier: f64,
 }
 
 impl Default for SwimConfig {
@@ -99,6 +121,7 @@ impl Default for SwimConfig {
             suspect_timeout_ms: DEFAULT_SUSPECT_TIMEOUT_MS,
             quarantine_ms: DEFAULT_QUARANTINE_MS,
             anti_entropy_interval_ms: DEFAULT_ANTI_ENTROPY_INTERVAL_MS,
+            retransmit_multiplier: DEFAULT_RETRANSMIT_MULTIPLIER,
         }
     }
 }
@@ -135,6 +158,7 @@ pub fn load_node_config(path: &Path) -> Result<AppConfig, ConfigError> {
         source,
     })?;
 
+    validate_node(path, &config.node)?;
     validate_swim(path, &config.swim)?;
     Ok(config)
 }
@@ -160,6 +184,17 @@ pub fn load_scenario(path: &Path) -> Result<ScenarioConfig, ConfigError> {
     Ok(config)
 }
 
+fn validate_node(path: &Path, node: &NodeConfig) -> Result<(), ConfigError> {
+    if node.node_id.as_str().trim().is_empty() {
+        return Err(invalid(path, "`node.node_id` must not be empty"));
+    }
+    if node.bind_addr.port() == 0 {
+        return Err(invalid(path, "`node.bind_addr` must use a non-zero port"));
+    }
+
+    Ok(())
+}
+
 fn validate_swim(path: &Path, swim: &SwimConfig) -> Result<(), ConfigError> {
     if swim.probe_interval_ms == 0 {
         return Err(invalid(path, "`probe_interval_ms` must be > 0"));
@@ -178,6 +213,12 @@ fn validate_swim(path: &Path, swim: &SwimConfig) -> Result<(), ConfigError> {
     }
     if swim.anti_entropy_interval_ms == 0 {
         return Err(invalid(path, "`anti_entropy_interval_ms` must be > 0"));
+    }
+    if !swim.retransmit_multiplier.is_finite() || swim.retransmit_multiplier <= 0.0 {
+        return Err(invalid(
+            path,
+            "`retransmit_multiplier` must be a finite number > 0",
+        ));
     }
     if swim.suspect_timeout_ms < swim.ack_timeout_ms {
         return Err(invalid(
@@ -258,9 +299,14 @@ fn invalid(path: &Path, message: &'static str) -> ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{ConfigError, FaultAction, HarnessConfig, ScheduledFault, validate_harness};
+    use super::{
+        ConfigError, FaultAction, HarnessConfig, ScheduledFault, SwimConfig, load_node_config,
+        validate_harness, validate_swim,
+    };
 
     #[test]
     fn validate_harness_enforces_high_port_node_count_boundary() {
@@ -307,5 +353,51 @@ mod tests {
         };
 
         assert!(validate_harness(Path::new("scenario.toml"), &harness).is_err());
+    }
+
+    #[test]
+    fn load_node_config_rejects_blank_node_id() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        let config_path =
+            std::env::temp_dir().join(format!("vortex-membership-node-config-{unique}.toml"));
+
+        let payload = r#"
+[node]
+node_id = "  "
+bind_addr = "127.0.0.1:15000"
+
+[swim]
+probe_interval_ms = 1000
+ack_timeout_ms = 300
+indirect_ping_count = 3
+suspect_timeout_ms = 3000
+quarantine_ms = 60000
+anti_entropy_interval_ms = 5000
+"#;
+        let write_result = fs::write(&config_path, payload);
+        assert!(write_result.is_ok());
+
+        assert!(matches!(
+            load_node_config(&config_path),
+            Err(ConfigError::Invalid { message, .. })
+                if message == "`node.node_id` must not be empty"
+        ));
+    }
+
+    #[test]
+    fn validate_swim_rejects_non_positive_retransmit_multiplier() {
+        let path = Path::new("scenario.toml");
+        let swim = SwimConfig {
+            retransmit_multiplier: 0.0,
+            ..SwimConfig::default()
+        };
+
+        assert!(matches!(
+            validate_swim(path, &swim),
+            Err(ConfigError::Invalid { message, .. })
+                if message == "`retransmit_multiplier` must be a finite number > 0"
+        ));
     }
 }

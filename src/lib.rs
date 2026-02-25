@@ -17,6 +17,12 @@ pub enum AppError {
     TracingInit,
     #[error("configuration error: {0}")]
     Config(#[from] config::ConfigError),
+    #[error("invalid lab output configuration: {message}")]
+    InvalidLabOutput { message: String },
+    #[error("node runtime error: {0}")]
+    Node(#[from] node::NodeError),
     #[error("harness error: {0}")]
     Harness(#[from] harness::HarnessError),
+    #[error("report error: {0}")]
+    Report(#[from] report::ReportError),
 }
