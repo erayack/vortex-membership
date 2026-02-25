@@ -1,12 +1,122 @@
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::sync::{Mutex, OnceLock};
 
 use bincode::config;
 use tokio::net::UdpSocket;
+use tokio::time::{Duration, sleep};
 
 use crate::protocol::WireMessage;
 
 pub const MAX_PACKET_SIZE: usize = 1_200;
 const MAX_UDP_DATAGRAM_SIZE: usize = 65_507;
+type Link = (SocketAddr, SocketAddr);
+
+#[derive(Clone, Debug, Default)]
+pub struct NetworkEmulator {
+    rules: std::sync::Arc<Mutex<NetworkRules>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NetworkRules {
+    delay_by_link_ms: HashMap<Link, u64>,
+    loss_by_link: HashMap<Link, f64>,
+    partitions: Vec<(BTreeSet<SocketAddr>, BTreeSet<SocketAddr>)>,
+    packet_counter: u64,
+}
+
+impl NetworkEmulator {
+    pub fn clear(&self) {
+        if let Ok(mut rules) = self.rules.lock() {
+            rules.delay_by_link_ms.clear();
+            rules.loss_by_link.clear();
+            rules.partitions.clear();
+            rules.packet_counter = 0;
+        }
+    }
+
+    pub fn set_delay(&self, from: SocketAddr, to: SocketAddr, delay_ms: u64) {
+        if let Ok(mut rules) = self.rules.lock() {
+            if delay_ms == 0 {
+                rules.delay_by_link_ms.remove(&(from, to));
+            } else {
+                rules.delay_by_link_ms.insert((from, to), delay_ms);
+            }
+        }
+    }
+
+    pub fn set_loss(&self, from: SocketAddr, to: SocketAddr, loss_rate: f64) {
+        if let Ok(mut rules) = self.rules.lock() {
+            if loss_rate <= 0.0 {
+                rules.loss_by_link.remove(&(from, to));
+            } else {
+                rules
+                    .loss_by_link
+                    .insert((from, to), loss_rate.clamp(0.0, 1.0));
+            }
+        }
+    }
+
+    pub fn add_partition(&self, left: BTreeSet<SocketAddr>, right: BTreeSet<SocketAddr>) {
+        if let Ok(mut rules) = self.rules.lock() {
+            rules.partitions.push((left, right));
+        }
+    }
+
+    pub fn clear_partitions(&self) {
+        if let Ok(mut rules) = self.rules.lock() {
+            rules.partitions.clear();
+        }
+    }
+
+    fn plan_send(&self, from: SocketAddr, to: SocketAddr) -> SendPlan {
+        let Ok(mut rules) = self.rules.lock() else {
+            return SendPlan {
+                drop_packet: false,
+                delay_ms: 0,
+            };
+        };
+
+        let is_partitioned = rules.partitions.iter().any(|(left, right)| {
+            (left.contains(&from) && right.contains(&to))
+                || (left.contains(&to) && right.contains(&from))
+        });
+        if is_partitioned {
+            return SendPlan {
+                drop_packet: true,
+                delay_ms: 0,
+            };
+        }
+
+        let delay_ms = rules
+            .delay_by_link_ms
+            .get(&(from, to))
+            .copied()
+            .unwrap_or(0);
+        let loss_rate = rules.loss_by_link.get(&(from, to)).copied().unwrap_or(0.0);
+
+        rules.packet_counter = rules.packet_counter.saturating_add(1);
+        let random = unit_interval(splitmix64(rules.packet_counter));
+        let drop_packet = random < loss_rate;
+
+        SendPlan {
+            drop_packet,
+            delay_ms,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SendPlan {
+    drop_packet: bool,
+    delay_ms: u64,
+}
+
+#[must_use]
+pub fn netem() -> &'static NetworkEmulator {
+    static NETEM: OnceLock<NetworkEmulator> = OnceLock::new();
+    NETEM.get_or_init(NetworkEmulator::default)
+}
 
 pub struct UdpTransport {
     socket: UdpSocket,
@@ -46,6 +156,15 @@ impl UdpTransport {
     /// - [`TransportError::SendTo`] on UDP send failure
     /// - [`TransportError::ShortSend`] if the socket reports partial send
     pub async fn send(&self, to: SocketAddr, msg: &WireMessage) -> Result<(), TransportError> {
+        let from = self.local_addr()?;
+        let send_plan = netem().plan_send(from, to);
+        if send_plan.drop_packet {
+            return Ok(());
+        }
+        if send_plan.delay_ms > 0 {
+            sleep(Duration::from_millis(send_plan.delay_ms)).await;
+        }
+
         let payload = bincode::serde::encode_to_vec(msg, config::standard())
             .map_err(|source| TransportError::Serialize { source })?;
 
@@ -101,6 +220,25 @@ impl UdpTransport {
 
         Ok((from, msg))
     }
+}
+
+const fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn u64_to_f64_lossless(value: u64) -> f64 {
+    let hi = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let lo = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(hi) * 4_294_967_296.0 + f64::from(lo)
+}
+
+fn unit_interval(value: u64) -> f64 {
+    let numerator = u64_to_f64_lossless(value);
+    let denominator = u64_to_f64_lossless(u64::MAX);
+    numerator / denominator
 }
 
 #[derive(Debug, thiserror::Error)]

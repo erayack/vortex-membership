@@ -5,6 +5,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use vortex_membership::AppError;
 use vortex_membership::config::{load_node_config, load_scenario};
+use vortex_membership::harness::run_scenario;
 
 #[derive(Debug, Parser)]
 #[command(name = "vortex-membership")]
@@ -53,10 +54,16 @@ async fn main() -> Result<(), AppError> {
         }
         Mode::Lab { scenario } => {
             let scenario_config = load_scenario(&scenario)?;
+            let report = run_scenario(scenario_config.clone()).await?;
             info!(
                 path = %scenario.display(),
                 quarantine_ms = scenario_config.swim.quarantine_ms,
-                "starting lab mode bootstrap"
+                detection_p50_ms = report.detection_p50_ms,
+                detection_p95_ms = report.detection_p95_ms,
+                false_suspicions = report.false_suspicions,
+                convergence_ms = report.convergence_ms,
+                owner_churn_per_min = report.owner_churn_per_min,
+                "completed lab scenario"
             );
         }
     }

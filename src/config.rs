@@ -23,9 +23,61 @@ pub struct ScenarioConfig {
     pub swim: SwimConfig,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-pub struct HarnessConfig {}
+pub struct HarnessConfig {
+    pub node_count: usize,
+    pub base_port: u16,
+    pub runtime_ms: u64,
+    pub key_count: usize,
+    pub random_seed: u64,
+    pub artifact_path: Option<PathBuf>,
+    pub events: Vec<ScheduledFault>,
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            node_count: 5,
+            base_port: 15_000,
+            runtime_ms: 20_000,
+            key_count: 128,
+            random_seed: 42,
+            artifact_path: None,
+            events: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScheduledFault {
+    pub at_ms: u64,
+    #[serde(flatten)]
+    pub action: FaultAction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FaultAction {
+    Kill {
+        node: usize,
+    },
+    Delay {
+        from: usize,
+        to: usize,
+        delay_ms: u64,
+    },
+    Loss {
+        from: usize,
+        to: usize,
+        loss_rate: f64,
+    },
+    Partition {
+        left: Vec<usize>,
+        right: Vec<usize>,
+    },
+    Heal,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -104,6 +156,7 @@ pub fn load_scenario(path: &Path) -> Result<ScenarioConfig, ConfigError> {
     })?;
 
     validate_swim(path, &config.swim)?;
+    validate_harness(path, &config.harness)?;
     Ok(config)
 }
 
@@ -136,9 +189,123 @@ fn validate_swim(path: &Path, swim: &SwimConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_harness(path: &Path, harness: &HarnessConfig) -> Result<(), ConfigError> {
+    if harness.node_count < 2 {
+        return Err(invalid(path, "`node_count` must be >= 2"));
+    }
+    if harness.runtime_ms == 0 {
+        return Err(invalid(path, "`runtime_ms` must be > 0"));
+    }
+    if harness.key_count == 0 {
+        return Err(invalid(path, "`key_count` must be > 0"));
+    }
+
+    let max_nodes = usize::from(u16::MAX.saturating_sub(harness.base_port)) + 1;
+    if harness.node_count > max_nodes {
+        return Err(invalid(
+            path,
+            "`node_count` is too large for `base_port` range",
+        ));
+    }
+
+    for fault in &harness.events {
+        if fault.at_ms > harness.runtime_ms {
+            return Err(invalid(path, "fault schedule exceeds `runtime_ms`"));
+        }
+        match &fault.action {
+            FaultAction::Kill { node } => {
+                if *node >= harness.node_count {
+                    return Err(invalid(path, "kill fault references unknown node"));
+                }
+            }
+            FaultAction::Delay { from, to, .. } => {
+                if *from >= harness.node_count || *to >= harness.node_count {
+                    return Err(invalid(path, "delay fault references unknown node"));
+                }
+            }
+            FaultAction::Loss {
+                from,
+                to,
+                loss_rate,
+            } => {
+                if *from >= harness.node_count || *to >= harness.node_count {
+                    return Err(invalid(path, "loss fault references unknown node"));
+                }
+                if !loss_rate.is_finite() || !(0.0..=1.0).contains(loss_rate) {
+                    return Err(invalid(path, "`loss_rate` must be in [0.0, 1.0]"));
+                }
+            }
+            FaultAction::Partition { left, right } => {
+                let left_ok = left.iter().all(|node| *node < harness.node_count);
+                let right_ok = right.iter().all(|node| *node < harness.node_count);
+                if !left_ok || !right_ok {
+                    return Err(invalid(path, "partition fault references unknown node"));
+                }
+            }
+            FaultAction::Heal => {}
+        }
+    }
+
+    Ok(())
+}
+
 fn invalid(path: &Path, message: &'static str) -> ConfigError {
     ConfigError::Invalid {
         path: path.to_path_buf(),
         message: message.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{ConfigError, FaultAction, HarnessConfig, ScheduledFault, validate_harness};
+
+    #[test]
+    fn validate_harness_enforces_high_port_node_count_boundary() {
+        let path = Path::new("scenario.toml");
+        let mut harness = HarnessConfig {
+            base_port: u16::MAX - 1,
+            node_count: 2,
+            ..HarnessConfig::default()
+        };
+        assert!(validate_harness(path, &harness).is_ok());
+
+        harness.node_count = 3;
+        assert!(matches!(
+            validate_harness(path, &harness),
+            Err(ConfigError::Invalid { message, .. })
+                if message == "`node_count` is too large for `base_port` range"
+        ));
+
+        let overflow_edge = HarnessConfig {
+            base_port: u16::MAX,
+            node_count: 2,
+            ..HarnessConfig::default()
+        };
+        assert!(matches!(
+            validate_harness(path, &overflow_edge),
+            Err(ConfigError::Invalid { message, .. })
+                if message == "`node_count` is too large for `base_port` range"
+        ));
+    }
+
+    #[test]
+    fn validate_harness_rejects_unknown_fault_node() {
+        let harness = HarnessConfig {
+            node_count: 2,
+            events: vec![ScheduledFault {
+                at_ms: 1,
+                action: FaultAction::Delay {
+                    from: 2,
+                    to: 1,
+                    delay_ms: 5,
+                },
+            }],
+            ..HarnessConfig::default()
+        };
+
+        assert!(validate_harness(Path::new("scenario.toml"), &harness).is_err());
     }
 }

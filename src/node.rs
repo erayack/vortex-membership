@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use tokio::select;
+use tokio::sync::{mpsc, watch};
 use tokio::time;
 
 use crate::anti_entropy::AntiEntropy;
@@ -11,7 +12,7 @@ use crate::ownership::OwnershipResolver;
 use crate::protocol::WireMessage;
 use crate::state::{ApplyResult, MembershipStore};
 use crate::transport::{TransportError, UdpTransport};
-use crate::types::{MemberStatus, MembershipUpdate, NodeId};
+use crate::types::{MemberRecord, MemberStatus, MembershipUpdate, NodeId};
 
 const RUNTIME_TICK_MS: u64 = 50;
 
@@ -30,6 +31,23 @@ pub enum RouteDecision {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NodeEvent {
+    DetectorMarked {
+        emitter: NodeId,
+        target: NodeId,
+        status: MemberStatus,
+        at_ms: u64,
+    },
+    MembershipApplied {
+        observer: NodeId,
+        update: MembershipUpdate,
+        view_epoch: u64,
+        alive_members: Vec<MemberRecord>,
+        at_ms: u64,
+    },
+}
+
 pub struct NodeRuntime {
     local_node_id: NodeId,
     anti_entropy_interval_ms: u64,
@@ -38,6 +56,7 @@ pub struct NodeRuntime {
     failure_detector: FailureDetector,
     disseminator: Disseminator,
     ownership: OwnershipResolver,
+    observer: Option<mpsc::UnboundedSender<NodeEvent>>,
     started_at: Instant,
     last_anti_entropy_ms: u64,
 }
@@ -61,9 +80,16 @@ impl NodeRuntime {
             failure_detector,
             disseminator,
             ownership,
+            observer: None,
             started_at: Instant::now(),
             last_anti_entropy_ms: 0,
         }
+    }
+
+    #[must_use]
+    pub fn with_observer(mut self, observer: mpsc::UnboundedSender<NodeEvent>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Runs the node event loop until interrupted by CTRL-C.
@@ -78,6 +104,38 @@ impl NodeRuntime {
             select! {
                 _ = tokio::signal::ctrl_c() => {
                     return Ok(());
+                }
+                _ = runtime_tick.tick() => {
+                    let now_ms = self.now_ms();
+                    self.handle_detector_tick(now_ms).await?;
+                    self.maybe_run_anti_entropy(now_ms).await?;
+                }
+                recv = self.transport.recv() => {
+                    let (from_addr, msg) = recv.map_err(NodeError::Transport)?;
+                    let now_ms = self.now_ms();
+                    self.handle_inbound(from_addr, msg, now_ms).await?;
+                }
+            }
+        }
+    }
+
+    /// Runs the node event loop until a shutdown signal is received.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError`] when receive/send operations fail.
+    pub async fn run_until_shutdown(
+        mut self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), NodeError> {
+        let mut runtime_tick = time::interval(Duration::from_millis(RUNTIME_TICK_MS));
+
+        loop {
+            select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
                 }
                 _ = runtime_tick.tick() => {
                     let now_ms = self.now_ms();
@@ -181,9 +239,11 @@ impl NodeRuntime {
                     }
                 }
                 DetectorAction::MarkSuspect { target } => {
+                    self.emit_detector_event(&target, MemberStatus::Suspect, now_ms);
                     self.emit_detector_update(&target, MemberStatus::Suspect, now_ms);
                 }
                 DetectorAction::MarkDead { target } => {
+                    self.emit_detector_event(&target, MemberStatus::Dead, now_ms);
                     self.emit_detector_update(&target, MemberStatus::Dead, now_ms);
                 }
             }
@@ -212,6 +272,17 @@ impl NodeRuntime {
             source_node_id: self.local_node_id.clone(),
         };
         self.apply_and_track(update, now_ms);
+    }
+
+    fn emit_detector_event(&self, target: &NodeId, status: MemberStatus, now_ms: u64) {
+        if let Some(observer) = &self.observer {
+            let _ = observer.send(NodeEvent::DetectorMarked {
+                emitter: self.local_node_id.clone(),
+                target: target.clone(),
+                status,
+                at_ms: now_ms,
+            });
+        }
     }
 
     async fn maybe_run_anti_entropy(&mut self, now_ms: u64) -> Result<(), NodeError> {
@@ -380,12 +451,7 @@ impl NodeRuntime {
             .map_err(NodeError::Transport)
     }
 
-    fn handle_join_ack(
-        &mut self,
-        accepted: crate::types::MemberRecord,
-        members: Vec<crate::types::MemberRecord>,
-        now_ms: u64,
-    ) {
+    fn handle_join_ack(&mut self, accepted: MemberRecord, members: Vec<MemberRecord>, now_ms: u64) {
         let accepted_update = MembershipUpdate {
             node_id: accepted.node_id.clone(),
             addr: accepted.addr,
@@ -442,6 +508,15 @@ impl NodeRuntime {
 
     fn apply_and_track(&mut self, update: MembershipUpdate, now_ms: u64) {
         if let ApplyResult::Applied { .. } = self.store.apply_update(update.clone(), now_ms) {
+            if let Some(observer) = &self.observer {
+                let _ = observer.send(NodeEvent::MembershipApplied {
+                    observer: self.local_node_id.clone(),
+                    update: update.clone(),
+                    view_epoch: self.store.view_epoch(),
+                    alive_members: self.store.snapshot_alive(),
+                    at_ms: now_ms,
+                });
+            }
             self.disseminator.enqueue(update);
         }
     }
