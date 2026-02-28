@@ -13,6 +13,12 @@ const DEFAULT_SUSPECT_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_QUARANTINE_MS: u64 = 60_000;
 const DEFAULT_ANTI_ENTROPY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_RETRANSMIT_MULTIPLIER: f64 = 4.0;
+const DEFAULT_OBSERVER_BUFFER: usize = 1_024;
+const DEFAULT_OWNERSHIP_STABILITY_WINDOW_MS: u64 = 3_000;
+const DEFAULT_OWNERSHIP_MAX_TRACKED_KEYS: usize = 16_384;
+const DEFAULT_OWNERSHIP_FAST_CUTOVER_ON_TERMINAL: bool = true;
+const DEFAULT_LIFEGUARD_ENABLED: bool = false;
+const DEFAULT_LIFEGUARD_MAX_MULTIPLIER: f64 = 2.0;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -110,6 +116,12 @@ pub struct SwimConfig {
     pub quarantine_ms: u64,
     pub anti_entropy_interval_ms: u64,
     pub retransmit_multiplier: f64,
+    pub observer_buffer: usize,
+    pub ownership_stability_window_ms: u64,
+    pub ownership_max_tracked_keys: usize,
+    pub ownership_fast_cutover_on_terminal: bool,
+    pub lifeguard_enabled: bool,
+    pub lifeguard_max_multiplier: f64,
 }
 
 impl Default for SwimConfig {
@@ -122,6 +134,12 @@ impl Default for SwimConfig {
             quarantine_ms: DEFAULT_QUARANTINE_MS,
             anti_entropy_interval_ms: DEFAULT_ANTI_ENTROPY_INTERVAL_MS,
             retransmit_multiplier: DEFAULT_RETRANSMIT_MULTIPLIER,
+            observer_buffer: DEFAULT_OBSERVER_BUFFER,
+            ownership_stability_window_ms: DEFAULT_OWNERSHIP_STABILITY_WINDOW_MS,
+            ownership_max_tracked_keys: DEFAULT_OWNERSHIP_MAX_TRACKED_KEYS,
+            ownership_fast_cutover_on_terminal: DEFAULT_OWNERSHIP_FAST_CUTOVER_ON_TERMINAL,
+            lifeguard_enabled: DEFAULT_LIFEGUARD_ENABLED,
+            lifeguard_max_multiplier: DEFAULT_LIFEGUARD_MAX_MULTIPLIER,
         }
     }
 }
@@ -218,6 +236,24 @@ fn validate_swim(path: &Path, swim: &SwimConfig) -> Result<(), ConfigError> {
         return Err(invalid(
             path,
             "`retransmit_multiplier` must be a finite number > 0",
+        ));
+    }
+    if swim.observer_buffer == 0 {
+        return Err(invalid(path, "`observer_buffer` must be > 0"));
+    }
+    if swim.ownership_stability_window_ms == 0 {
+        return Err(invalid(path, "`ownership_stability_window_ms` must be > 0"));
+    }
+    if swim.ownership_max_tracked_keys == 0 {
+        return Err(invalid(path, "`ownership_max_tracked_keys` must be > 0"));
+    }
+    if !swim.lifeguard_max_multiplier.is_finite()
+        || swim.lifeguard_max_multiplier < 1.0
+        || swim.lifeguard_max_multiplier > 10.0
+    {
+        return Err(invalid(
+            path,
+            "`lifeguard_max_multiplier` must be a finite number in [1.0, 10.0]",
         ));
     }
     if swim.suspect_timeout_ms < swim.ack_timeout_ms {
@@ -399,5 +435,74 @@ anti_entropy_interval_ms = 5000
             Err(ConfigError::Invalid { message, .. })
                 if message == "`retransmit_multiplier` must be a finite number > 0"
         ));
+    }
+
+    #[test]
+    fn validate_swim_rejects_zero_observer_buffer() {
+        let path = Path::new("scenario.toml");
+        let swim = SwimConfig {
+            observer_buffer: 0,
+            ..SwimConfig::default()
+        };
+
+        assert!(matches!(
+            validate_swim(path, &swim),
+            Err(ConfigError::Invalid { message, .. }) if message == "`observer_buffer` must be > 0"
+        ));
+    }
+
+    #[test]
+    fn validate_swim_rejects_zero_ownership_stability_window() {
+        let path = Path::new("scenario.toml");
+        let swim = SwimConfig {
+            ownership_stability_window_ms: 0,
+            ..SwimConfig::default()
+        };
+
+        assert!(matches!(
+            validate_swim(path, &swim),
+            Err(ConfigError::Invalid { message, .. })
+                if message == "`ownership_stability_window_ms` must be > 0"
+        ));
+    }
+
+    #[test]
+    fn validate_swim_rejects_zero_ownership_max_tracked_keys() {
+        let path = Path::new("scenario.toml");
+        let swim = SwimConfig {
+            ownership_max_tracked_keys: 0,
+            ..SwimConfig::default()
+        };
+
+        assert!(matches!(
+            validate_swim(path, &swim),
+            Err(ConfigError::Invalid { message, .. })
+                if message == "`ownership_max_tracked_keys` must be > 0"
+        ));
+    }
+
+    #[test]
+    fn validate_swim_rejects_out_of_range_lifeguard_max_multiplier() {
+        let path = Path::new("scenario.toml");
+        let too_low = SwimConfig {
+            lifeguard_max_multiplier: 0.5,
+            ..SwimConfig::default()
+        };
+        let too_high = SwimConfig {
+            lifeguard_max_multiplier: 10.1,
+            ..SwimConfig::default()
+        };
+        let non_finite = SwimConfig {
+            lifeguard_max_multiplier: f64::INFINITY,
+            ..SwimConfig::default()
+        };
+
+        for swim in [too_low, too_high, non_finite] {
+            assert!(matches!(
+                validate_swim(path, &swim),
+                Err(ConfigError::Invalid { message, .. })
+                    if message == "`lifeguard_max_multiplier` must be a finite number in [1.0, 10.0]"
+            ));
+        }
     }
 }
