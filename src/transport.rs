@@ -365,10 +365,14 @@ mod tests {
             crate::types::MemberDigest {
                 node_id: NodeId::from("node-a"),
                 incarnation: 2,
+                status: MemberStatus::Alive,
+                last_changed_ms: 100,
             },
             crate::types::MemberDigest {
                 node_id: NodeId::from("node-b"),
                 incarnation: 1,
+                status: MemberStatus::Suspect,
+                last_changed_ms: 90,
             },
         ];
         let updates = vec![

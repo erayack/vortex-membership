@@ -1,13 +1,27 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
-use crate::types::{MemberDigest, MemberRecord, MemberStatus, MembershipUpdate, NodeId, ViewEpoch};
+use crate::types::{
+    Incarnation, MemberDigest, MemberRecord, MemberStatus, MembershipUpdate, NodeId, ViewEpoch,
+};
 
 const DEFAULT_RECENT_UPDATE_LIMIT: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedTransition {
+    pub previous_status: Option<MemberStatus>,
+    pub current_status: MemberStatus,
+    pub node_id: NodeId,
+    pub incarnation: Incarnation,
+    pub view_epoch: ViewEpoch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplyResult {
-    Applied { epoch_bumped: bool },
+    Applied {
+        epoch_bumped: bool,
+        transition: AppliedTransition,
+    },
     IgnoredStale,
     RequiresRefutation(NodeId),
 }
@@ -77,6 +91,15 @@ impl MembershipStore {
 
     #[must_use]
     pub fn mark_local_alive_with_new_incarnation(&mut self, now_ms: u64) -> MembershipUpdate {
+        let (update, _) = self.mark_local_alive_with_new_incarnation_with_result(now_ms);
+        update
+    }
+
+    #[must_use]
+    pub fn mark_local_alive_with_new_incarnation_with_result(
+        &mut self,
+        now_ms: u64,
+    ) -> (MembershipUpdate, ApplyResult) {
         let next_incarnation = self
             .members
             .get(&self.local_node_id)
@@ -92,8 +115,8 @@ impl MembershipStore {
             source_node_id: self.local_node_id.clone(),
         };
 
-        let _ = self.apply_update(update.clone(), now_ms);
-        update
+        let result = self.apply_update(update.clone(), now_ms);
+        (update, result)
     }
 
     #[must_use]
@@ -141,6 +164,8 @@ impl MembershipStore {
             .map(|record| MemberDigest {
                 node_id: record.node_id.clone(),
                 incarnation: record.incarnation,
+                status: record.status,
+                last_changed_ms: record.last_changed_ms,
             })
             .collect();
         digest.sort_by(|left, right| left.node_id.cmp(&right.node_id));
@@ -237,11 +262,18 @@ impl MembershipStore {
     }
 
     fn commit_update(&mut self, update: MembershipUpdate, now_ms: u64) -> ApplyResult {
+        let previous_status = self
+            .members
+            .get(&update.node_id)
+            .map(|record| record.status);
+        let node_id = update.node_id.clone();
+        let current_status = update.status;
+        let incarnation = update.incarnation;
         let new_record = MemberRecord {
-            node_id: update.node_id.clone(),
+            node_id: node_id.clone(),
             addr: update.addr,
-            incarnation: update.incarnation,
-            status: update.status,
+            incarnation,
+            status: current_status,
             last_changed_ms: update.last_changed_ms,
         };
 
@@ -254,12 +286,21 @@ impl MembershipStore {
             return ApplyResult::IgnoredStale;
         }
 
-        self.members.insert(update.node_id.clone(), new_record);
-        self.apply_quarantine_effects(&update.node_id, update.status, now_ms);
+        self.members.insert(node_id.clone(), new_record);
+        self.apply_quarantine_effects(&node_id, current_status, now_ms);
         self.push_recent_update(update);
         self.view_epoch = self.view_epoch.saturating_add(1);
 
-        ApplyResult::Applied { epoch_bumped: true }
+        ApplyResult::Applied {
+            epoch_bumped: true,
+            transition: AppliedTransition {
+                previous_status,
+                current_status,
+                node_id,
+                incarnation,
+                view_epoch: self.view_epoch,
+            },
+        }
     }
 
     fn apply_quarantine_effects(&mut self, node_id: &NodeId, status: MemberStatus, now_ms: u64) {
@@ -327,7 +368,16 @@ mod tests {
             20,
         );
 
-        assert_eq!(result, ApplyResult::Applied { epoch_bumped: true });
+        assert!(matches!(
+            result,
+            ApplyResult::Applied {
+                epoch_bumped: true,
+                transition
+            } if transition.previous_status == Some(MemberStatus::Suspect)
+                && transition.current_status == MemberStatus::Alive
+                && transition.node_id == NodeId::from("node-a")
+                && transition.incarnation == 2
+        ));
         let alive = store.snapshot_alive();
         assert!(
             alive

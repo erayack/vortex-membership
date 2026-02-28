@@ -49,6 +49,27 @@ pub enum MemberStatus {
     Left,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum MembershipEventKind {
+    Join,
+    Suspect,
+    Dead,
+    Left,
+    Recovered,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MembershipEvent {
+    pub kind: MembershipEventKind,
+    pub node_id: NodeId,
+    pub previous_status: Option<MemberStatus>,
+    pub current_status: MemberStatus,
+    pub incarnation: Incarnation,
+    pub view_epoch: ViewEpoch,
+    pub observed_by: NodeId,
+    pub at_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MemberRecord {
     pub node_id: NodeId,
@@ -58,10 +79,19 @@ pub struct MemberRecord {
     pub last_changed_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct UpdateVersion {
+    pub incarnation: Incarnation,
+    pub status: MemberStatus,
+    pub last_changed_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MemberDigest {
     pub node_id: NodeId,
     pub incarnation: Incarnation,
+    pub status: MemberStatus,
+    pub last_changed_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,6 +108,15 @@ pub struct MembershipUpdate {
 }
 
 impl MembershipUpdate {
+    #[must_use]
+    pub const fn version(&self) -> UpdateVersion {
+        UpdateVersion {
+            incarnation: self.incarnation,
+            status: self.status,
+            last_changed_ms: self.last_changed_ms,
+        }
+    }
+
     /// Returns true when `self` should replace `other` for the same target node.
     #[must_use]
     pub fn supersedes(&self, other: &Self) -> bool {
@@ -85,13 +124,32 @@ impl MembershipUpdate {
             return false;
         }
 
-        match self.incarnation.cmp(&other.incarnation) {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => {
-                self.status > other.status
-                    || (self.status == other.status && self.last_changed_ms > other.last_changed_ms)
-            }
+        self.version() > other.version()
+    }
+}
+
+impl From<&MembershipUpdate> for UpdateVersion {
+    fn from(value: &MembershipUpdate) -> Self {
+        value.version()
+    }
+}
+
+impl From<&MemberRecord> for UpdateVersion {
+    fn from(value: &MemberRecord) -> Self {
+        Self {
+            incarnation: value.incarnation,
+            status: value.status,
+            last_changed_ms: value.last_changed_ms,
+        }
+    }
+}
+
+impl From<&MemberDigest> for UpdateVersion {
+    fn from(value: &MemberDigest) -> Self {
+        Self {
+            incarnation: value.incarnation,
+            status: value.status,
+            last_changed_ms: value.last_changed_ms,
         }
     }
 }
