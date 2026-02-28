@@ -2,19 +2,25 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Instant;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
 use crate::config::{FaultAction, ScenarioConfig, ScheduledFault};
 use crate::dissemination::Disseminator;
 use crate::failure_detector::FailureDetector;
-use crate::node::{NodeError, NodeEvent, NodeRuntime};
-use crate::ownership::OwnershipResolver;
-use crate::report::{ReportError, RunArtifact, RunReport, percentile, write_run_artifact};
+use crate::node::{NodeError, NodeRuntime};
+use crate::ownership::{
+    OwnershipResolver, StickyDecision, StickyOwnershipConfig, StickyOwnershipResolver,
+};
+use crate::report::{
+    ReportError, RunArtifact, RunReport, percentile, percentile_f64, write_run_artifact,
+};
 use crate::state::MembershipStore;
 use crate::transport::{TransportError, UdpTransport, netem};
-use crate::types::{MemberStatus, MembershipUpdate, NodeId};
+use crate::types::{
+    MemberRecord, MemberStatus, MembershipEvent, MembershipEventKind, MembershipUpdate, NodeId,
+};
 
 /// Runs a complete simulation scenario and writes the resulting artifact report.
 ///
@@ -36,20 +42,28 @@ pub async fn run_scenario(cfg: ScenarioConfig) -> Result<RunReport, HarnessError
         .cloned()
         .ok_or_else(|| HarnessError::InvalidScenario("no nodes configured".to_owned()))?;
     let keys = generate_keys(cfg.harness.key_count, cfg.harness.random_seed);
+    let sticky_config = StickyOwnershipConfig::new(
+        cfg.swim.ownership_stability_window_ms,
+        cfg.swim.ownership_max_tracked_keys,
+        cfg.swim.ownership_fast_cutover_on_terminal,
+    );
 
     netem().clear();
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let mut handles = spawn_nodes(&cfg, &node_ids, &addresses, &event_tx, &shutdown_rx).await?;
-    drop(event_tx);
+    let SpawnedNodes {
+        mut handles,
+        mut membership_receivers,
+        mut lifeguard_receivers,
+    } = spawn_nodes(&cfg, &node_ids, &addresses, &shutdown_rx, &sticky_config).await?;
 
     let mut metrics = MetricsCollector::new(
-        node_ids.clone(),
+        &node_ids,
         observer_node,
         keys,
         cfg.harness.runtime_ms,
+        sticky_config,
     );
 
     run_event_loop(
@@ -59,7 +73,8 @@ pub async fn run_scenario(cfg: ScenarioConfig) -> Result<RunReport, HarnessError
         &node_ids,
         &mut handles,
         &mut metrics,
-        &mut event_rx,
+        &mut membership_receivers,
+        &mut lifeguard_receivers,
     )
     .await?;
 
@@ -77,9 +92,8 @@ pub async fn run_scenario(cfg: ScenarioConfig) -> Result<RunReport, HarnessError
         }
     }
 
-    while let Ok(event) = event_rx.try_recv() {
-        metrics.observe_node_event(event);
-    }
+    drain_membership_events(&mut membership_receivers, &mut metrics);
+    drain_lifeguard_samples(&mut lifeguard_receivers, &mut metrics);
 
     let artifact = metrics.finish(cfg.clone());
     let artifact_path = artifact.artifact_path_or_default(cfg.harness.artifact_path.clone());
@@ -91,10 +105,12 @@ async fn spawn_nodes(
     cfg: &ScenarioConfig,
     node_ids: &[NodeId],
     addresses: &[SocketAddr],
-    event_tx: &mpsc::UnboundedSender<NodeEvent>,
     shutdown_rx: &watch::Receiver<bool>,
-) -> Result<Vec<Option<JoinHandle<Result<(), NodeError>>>>, HarnessError> {
+    sticky_config: &StickyOwnershipConfig,
+) -> Result<SpawnedNodes, HarnessError> {
     let mut handles = Vec::with_capacity(cfg.harness.node_count);
+    let mut membership_receivers = Vec::with_capacity(cfg.harness.node_count);
+    let mut lifeguard_receivers = Vec::with_capacity(cfg.harness.node_count);
     for idx in 0..cfg.harness.node_count {
         let local_id = node_ids[idx].clone();
         let local_addr = addresses[idx];
@@ -116,15 +132,25 @@ async fn spawn_nodes(
                 cfg.harness.node_count,
                 cfg.swim.retransmit_multiplier,
             ),
-            OwnershipResolver::default(),
+            StickyOwnershipResolver::new(OwnershipResolver::default(), sticky_config.clone()),
         )
-        .with_observer(event_tx.clone());
+        .with_observer_buffer(cfg.swim.observer_buffer)
+        .with_lifeguard(
+            cfg.swim.lifeguard_enabled,
+            cfg.swim.lifeguard_max_multiplier,
+        );
+        membership_receivers.push(runtime.subscribe_membership());
+        lifeguard_receivers.push(runtime.subscribe_lifeguard());
 
         handles.push(Some(tokio::spawn(
             runtime.run_until_shutdown(shutdown_rx.clone()),
         )));
     }
-    Ok(handles)
+    Ok(SpawnedNodes {
+        handles,
+        membership_receivers,
+        lifeguard_receivers,
+    })
 }
 
 fn initialize_store(
@@ -156,6 +182,7 @@ fn initialize_store(
     store
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     cfg: &ScenarioConfig,
     faults: &[ScheduledFault],
@@ -163,7 +190,8 @@ async fn run_event_loop(
     node_ids: &[NodeId],
     handles: &mut [Option<JoinHandle<Result<(), NodeError>>>],
     metrics: &mut MetricsCollector,
-    event_rx: &mut mpsc::UnboundedReceiver<NodeEvent>,
+    membership_receivers: &mut [broadcast::Receiver<MembershipEvent>],
+    lifeguard_receivers: &mut [broadcast::Receiver<f64>],
 ) -> Result<(), HarnessError> {
     let start = Instant::now();
     let mut next_fault_idx = 0;
@@ -183,9 +211,8 @@ async fn run_event_loop(
             next_fault_idx += 1;
         }
 
-        while let Ok(event) = event_rx.try_recv() {
-            metrics.observe_node_event(event);
-        }
+        drain_membership_events(membership_receivers, metrics);
+        drain_lifeguard_samples(lifeguard_receivers, metrics);
 
         if elapsed_ms >= cfg.harness.runtime_ms {
             break;
@@ -193,6 +220,46 @@ async fn run_event_loop(
         tick.tick().await;
     }
     Ok(())
+}
+
+struct SpawnedNodes {
+    handles: Vec<Option<JoinHandle<Result<(), NodeError>>>>,
+    membership_receivers: Vec<broadcast::Receiver<MembershipEvent>>,
+    lifeguard_receivers: Vec<broadcast::Receiver<f64>>,
+}
+
+fn drain_membership_events(
+    membership_receivers: &mut [broadcast::Receiver<MembershipEvent>],
+    metrics: &mut MetricsCollector,
+) {
+    for receiver in membership_receivers {
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => metrics.observe_membership_event(event),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(
+                    broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed,
+                ) => break,
+            }
+        }
+    }
+}
+
+fn drain_lifeguard_samples(
+    lifeguard_receivers: &mut [broadcast::Receiver<f64>],
+    metrics: &mut MetricsCollector,
+) {
+    for receiver in lifeguard_receivers {
+        loop {
+            match receiver.try_recv() {
+                Ok(multiplier) => metrics.observe_lifeguard_multiplier(multiplier),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(
+                    broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed,
+                ) => break,
+            }
+        }
+    }
 }
 
 fn apply_fault(
@@ -323,40 +390,69 @@ struct MetricsCollector {
     false_suspicions: u64,
     suspicion_events_total: u64,
     active_nodes: HashSet<NodeId>,
+    member_status_views: HashMap<NodeId, HashMap<NodeId, MemberStatus>>,
     alive_views: HashMap<NodeId, BTreeSet<NodeId>>,
     heal_started_ms: Option<u64>,
     convergence_ms: Option<u64>,
     observer_node: NodeId,
     keyspace: Vec<Vec<u8>>,
-    ownership_resolver: OwnershipResolver,
-    previous_owners: Option<Vec<Option<NodeId>>>,
+    ownership_resolver: StickyOwnershipResolver,
+    previous_decisions: Option<Vec<StickyDecision>>,
+    previous_effective_owners: Option<Vec<Option<NodeId>>>,
     owner_reassignments: u64,
+    ownership_pending_total: u64,
+    ownership_cancelled_total: u64,
+    ownership_confirmed_total: u64,
     duration_ms: u64,
+    lifeguard_multiplier_samples: Vec<f64>,
 }
 
 impl MetricsCollector {
     fn new(
-        all_nodes: Vec<NodeId>,
+        all_nodes: &[NodeId],
         observer_node: NodeId,
         keyspace: Vec<Vec<u8>>,
         duration_ms: u64,
+        ownership_config: StickyOwnershipConfig,
     ) -> Self {
+        let active_nodes: HashSet<_> = all_nodes.iter().cloned().collect();
+        let mut member_status_views = HashMap::new();
+        let mut alive_views = HashMap::new();
+        for observer in all_nodes {
+            let status_by_member = all_nodes
+                .iter()
+                .cloned()
+                .map(|member| (member, MemberStatus::Alive))
+                .collect();
+            member_status_views.insert(observer.clone(), status_by_member);
+            alive_views.insert(observer.clone(), active_nodes.iter().cloned().collect());
+        }
+
         Self {
             detection_samples_ms: Vec::new(),
             detected_kills: HashSet::new(),
             kill_started_ms: HashMap::new(),
             false_suspicions: 0,
             suspicion_events_total: 0,
-            active_nodes: all_nodes.into_iter().collect(),
-            alive_views: HashMap::new(),
+            active_nodes,
+            member_status_views,
+            alive_views,
             heal_started_ms: None,
             convergence_ms: None,
             observer_node,
             keyspace,
-            ownership_resolver: OwnershipResolver::default(),
-            previous_owners: None,
+            ownership_resolver: StickyOwnershipResolver::new(
+                OwnershipResolver::default(),
+                ownership_config,
+            ),
+            previous_decisions: None,
+            previous_effective_owners: None,
             owner_reassignments: 0,
+            ownership_pending_total: 0,
+            ownership_cancelled_total: 0,
+            ownership_confirmed_total: 0,
             duration_ms,
+            lifeguard_multiplier_samples: Vec::new(),
         }
     }
 
@@ -370,65 +466,142 @@ impl MetricsCollector {
         self.convergence_ms = None;
     }
 
-    fn observe_node_event(&mut self, event: NodeEvent) {
-        match event {
-            NodeEvent::DetectorMarked {
-                target,
-                status,
-                at_ms,
-                ..
-            } => {
-                if !matches!(status, MemberStatus::Suspect | MemberStatus::Dead) {
-                    return;
+    fn observe_membership_event(&mut self, event: MembershipEvent) {
+        if matches!(
+            event.kind,
+            MembershipEventKind::Suspect | MembershipEventKind::Dead
+        ) {
+            self.suspicion_events_total = self.suspicion_events_total.saturating_add(1);
+            if let Some(started_ms) = self.kill_started_ms.get(&event.node_id) {
+                if self.detected_kills.insert(event.node_id.clone()) {
+                    self.detection_samples_ms
+                        .push(event.at_ms.saturating_sub(*started_ms));
                 }
-
-                self.suspicion_events_total = self.suspicion_events_total.saturating_add(1);
-                if let Some(started_ms) = self.kill_started_ms.get(&target) {
-                    if self.detected_kills.insert(target) {
-                        self.detection_samples_ms
-                            .push(at_ms.saturating_sub(*started_ms));
-                    }
-                } else {
-                    self.false_suspicions = self.false_suspicions.saturating_add(1);
-                }
+            } else {
+                self.false_suspicions = self.false_suspicions.saturating_add(1);
             }
-            NodeEvent::MembershipApplied {
-                observer,
-                alive_members,
-                at_ms,
-                ..
-            } => {
-                let alive_nodes = alive_members
-                    .iter()
-                    .map(|member| member.node_id.clone())
-                    .collect::<BTreeSet<_>>();
-                self.alive_views.insert(observer.clone(), alive_nodes);
+        }
 
-                if observer == self.observer_node {
-                    self.observe_ownership(&alive_members);
-                }
+        let status_by_member = self
+            .member_status_views
+            .entry(event.observed_by.clone())
+            .or_default();
+        status_by_member.insert(event.node_id, event.current_status);
+        let alive_nodes = status_by_member
+            .iter()
+            .filter_map(|(node_id, status)| (*status == MemberStatus::Alive).then_some(node_id))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.alive_views
+            .insert(event.observed_by.clone(), alive_nodes);
 
-                self.maybe_mark_converged(at_ms);
+        if event.observed_by == self.observer_node {
+            let observer_statuses = self.member_status_views.get(&event.observed_by).cloned();
+            if let Some(observer_statuses) = observer_statuses {
+                self.observe_ownership(&observer_statuses, event.at_ms);
             }
+        }
+
+        self.maybe_mark_converged(event.at_ms);
+    }
+
+    fn observe_lifeguard_multiplier(&mut self, multiplier: f64) {
+        if multiplier.is_finite() && multiplier >= 1.0 {
+            self.lifeguard_multiplier_samples.push(multiplier);
         }
     }
 
-    fn observe_ownership(&mut self, alive_members: &[crate::types::MemberRecord]) {
-        let current_owners = self
-            .keyspace
+    fn observe_ownership(
+        &mut self,
+        observer_statuses: &HashMap<NodeId, MemberStatus>,
+        now_ms: u64,
+    ) {
+        let all_members = observer_statuses
             .iter()
-            .map(|key| self.ownership_resolver.owner(key, alive_members))
+            .map(|(node_id, status)| MemberRecord {
+                node_id: node_id.clone(),
+                addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                incarnation: 0,
+                status: *status,
+                last_changed_ms: 0,
+            })
             .collect::<Vec<_>>();
 
-        if let Some(previous) = &self.previous_owners {
-            for (old, new) in previous.iter().zip(current_owners.iter()) {
+        let owner_eligible = all_members
+            .iter()
+            .filter(|member| member.status == MemberStatus::Alive)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let current_decisions = self
+            .keyspace
+            .iter()
+            .map(|key| {
+                self.ownership_resolver
+                    .decide(key, &owner_eligible, &all_members, now_ms)
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(previous_decisions) = self.previous_decisions.clone() {
+            for (previous, current) in previous_decisions.iter().zip(current_decisions.iter()) {
+                self.observe_sticky_transition(previous, current);
+            }
+        }
+
+        let current_effective_owners = current_decisions
+            .iter()
+            .map(effective_owner)
+            .collect::<Vec<_>>();
+
+        if let Some(previous) = &self.previous_effective_owners {
+            for (old, new) in previous.iter().zip(current_effective_owners.iter()) {
                 if old != new {
                     self.owner_reassignments = self.owner_reassignments.saturating_add(1);
                 }
             }
         }
 
-        self.previous_owners = Some(current_owners);
+        self.previous_effective_owners = Some(current_effective_owners);
+        self.previous_decisions = Some(current_decisions);
+    }
+
+    fn observe_sticky_transition(&mut self, previous: &StickyDecision, current: &StickyDecision) {
+        match (previous, current) {
+            (
+                StickyDecision::Pending {
+                    candidate_owner: previous_candidate_owner,
+                    ..
+                },
+                StickyDecision::Pending {
+                    candidate_owner: current_candidate_owner,
+                    ..
+                },
+            ) if previous_candidate_owner != current_candidate_owner => {
+                self.ownership_cancelled_total = self.ownership_cancelled_total.saturating_add(1);
+                self.ownership_pending_total = self.ownership_pending_total.saturating_add(1);
+            }
+            (
+                StickyDecision::Pending {
+                    candidate_owner, ..
+                },
+                StickyDecision::Stable { owner },
+            ) if candidate_owner == owner => {
+                self.ownership_confirmed_total = self.ownership_confirmed_total.saturating_add(1);
+            }
+            (
+                StickyDecision::Pending { .. },
+                StickyDecision::Stable { .. } | StickyDecision::NoRoute,
+            ) => {
+                self.ownership_cancelled_total = self.ownership_cancelled_total.saturating_add(1);
+            }
+            (
+                StickyDecision::Stable { .. } | StickyDecision::NoRoute,
+                StickyDecision::Pending { .. },
+            ) => {
+                self.ownership_pending_total = self.ownership_pending_total.saturating_add(1);
+            }
+            _ => {}
+        }
     }
 
     fn maybe_mark_converged(&mut self, at_ms: u64) {
@@ -478,6 +651,23 @@ impl MetricsCollector {
                 / u64_to_f64_lossless(self.suspicion_events_total)
         };
 
+        let (lifeguard_multiplier_avg, lifeguard_multiplier_p95, lifeguard_multiplier_max) =
+            if self.lifeguard_multiplier_samples.is_empty() {
+                (1.0, 1.0, 1.0)
+            } else {
+                let sum: f64 = self.lifeguard_multiplier_samples.iter().sum();
+                let len =
+                    u64::try_from(self.lifeguard_multiplier_samples.len()).unwrap_or(u64::MAX);
+                (
+                    sum / u64_to_f64_lossless(len),
+                    percentile_f64(&self.lifeguard_multiplier_samples, 0.95),
+                    self.lifeguard_multiplier_samples
+                        .iter()
+                        .copied()
+                        .fold(1.0_f64, f64::max),
+                )
+            };
+
         RunArtifact {
             scenario,
             report: RunReport {
@@ -486,10 +676,25 @@ impl MetricsCollector {
                 false_suspicions: self.false_suspicions,
                 convergence_ms: self.convergence_ms.unwrap_or(0),
                 owner_churn_per_min,
+                ownership_pending_total: self.ownership_pending_total,
+                ownership_cancelled_total: self.ownership_cancelled_total,
+                ownership_confirmed_total: self.ownership_confirmed_total,
+                lifeguard_multiplier_avg,
+                lifeguard_multiplier_p95,
+                lifeguard_multiplier_max,
             },
             false_suspicion_rate,
             detection_samples_ms: self.detection_samples_ms,
+            lifeguard_multiplier_samples: self.lifeguard_multiplier_samples,
         }
+    }
+}
+
+fn effective_owner(decision: &StickyDecision) -> Option<NodeId> {
+    match decision {
+        StickyDecision::Stable { owner } => Some(owner.clone()),
+        StickyDecision::Pending { stable_owner, .. } => Some(stable_owner.clone()),
+        StickyDecision::NoRoute => None,
     }
 }
 
@@ -514,8 +719,8 @@ mod tests {
 
     use super::{HarnessError, MetricsCollector, apply_fault};
     use crate::config::{FaultAction, ScenarioConfig, ScheduledFault};
-    use crate::node::NodeEvent;
-    use crate::types::{MemberRecord, MemberStatus, MembershipUpdate, NodeId};
+    use crate::ownership::StickyOwnershipConfig;
+    use crate::types::{MemberStatus, MembershipEvent, MembershipEventKind, NodeId};
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
@@ -523,7 +728,13 @@ mod tests {
 
     fn test_metrics() -> MetricsCollector {
         let nodes = vec![NodeId::from("node-0"), NodeId::from("node-1")];
-        MetricsCollector::new(nodes, NodeId::from("node-0"), vec![b"k".to_vec()], 1_000)
+        MetricsCollector::new(
+            &nodes,
+            NodeId::from("node-0"),
+            vec![b"k".to_vec()],
+            1_000,
+            StickyOwnershipConfig::default(),
+        )
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -547,35 +758,22 @@ mod tests {
         }))
     }
 
-    fn member(node_id: &str, port: u16) -> MemberRecord {
-        MemberRecord {
-            node_id: NodeId::from(node_id),
-            addr: localhost(port),
-            incarnation: 0,
-            status: MemberStatus::Alive,
-            last_changed_ms: 0,
-        }
-    }
-
-    fn membership_applied(
+    fn membership_event(
+        kind: MembershipEventKind,
         observer: &str,
-        alive_members: Vec<MemberRecord>,
+        node_id: &str,
+        previous_status: Option<MemberStatus>,
+        current_status: MemberStatus,
         at_ms: u64,
-    ) -> NodeEvent {
-        let observer_id = NodeId::from(observer);
-        NodeEvent::MembershipApplied {
-            observer: observer_id.clone(),
-            update: MembershipUpdate {
-                node_id: observer_id.clone(),
-                addr: localhost(16_000),
-                incarnation: 0,
-                status: MemberStatus::Alive,
-                last_changed_ms: at_ms,
-                origin_node_id: observer_id.clone(),
-                source_node_id: observer_id,
-            },
-            view_epoch: 0,
-            alive_members,
+    ) -> MembershipEvent {
+        MembershipEvent {
+            kind,
+            node_id: NodeId::from(node_id),
+            previous_status,
+            current_status,
+            incarnation: 1,
+            view_epoch: 1,
+            observed_by: NodeId::from(observer),
             at_ms,
         }
     }
@@ -672,25 +870,70 @@ mod tests {
             NodeId::from("node-1"),
             NodeId::from("node-2"),
         ];
-        let mut metrics =
-            MetricsCollector::new(nodes, NodeId::from("node-0"), vec![b"k".to_vec()], 1_000);
+        let mut metrics = MetricsCollector::new(
+            &nodes,
+            NodeId::from("node-0"),
+            vec![b"k".to_vec()],
+            1_000,
+            StickyOwnershipConfig::default(),
+        );
 
         metrics.note_kill(NodeId::from("node-2"), 100);
-        metrics.observe_node_event(NodeEvent::DetectorMarked {
-            emitter: NodeId::from("node-0"),
-            target: NodeId::from("node-2"),
-            status: MemberStatus::Dead,
+        metrics.observe_membership_event(MembershipEvent {
+            kind: MembershipEventKind::Dead,
+            node_id: NodeId::from("node-2"),
+            previous_status: Some(MemberStatus::Suspect),
+            current_status: MemberStatus::Dead,
+            incarnation: 1,
+            view_epoch: 1,
+            observed_by: NodeId::from("node-0"),
             at_ms: 130,
         });
 
         metrics.note_heal(200);
-        let alive = vec![member("node-0", 15_000), member("node-1", 15_001)];
-        metrics.observe_node_event(membership_applied("node-0", alive.clone(), 250));
-        metrics.observe_node_event(membership_applied("node-1", alive, 260));
+        metrics.observe_membership_event(membership_event(
+            MembershipEventKind::Dead,
+            "node-0",
+            "node-2",
+            Some(MemberStatus::Dead),
+            MemberStatus::Dead,
+            250,
+        ));
+        metrics.observe_membership_event(membership_event(
+            MembershipEventKind::Dead,
+            "node-1",
+            "node-2",
+            Some(MemberStatus::Dead),
+            MemberStatus::Dead,
+            260,
+        ));
 
         let report = metrics.finish(ScenarioConfig::default()).report;
         assert_eq!(report.detection_p50_ms, 30);
         assert_eq!(report.detection_p95_ms, 30);
         assert_eq!(report.convergence_ms, 60);
+    }
+
+    #[test]
+    fn metrics_default_lifeguard_stats_to_one_without_samples() {
+        let report = test_metrics().finish(ScenarioConfig::default()).report;
+        assert!((report.lifeguard_multiplier_avg - 1.0).abs() < f64::EPSILON);
+        assert!((report.lifeguard_multiplier_p95 - 1.0).abs() < f64::EPSILON);
+        assert!((report.lifeguard_multiplier_max - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_lifeguard_stats_ignore_invalid_samples() {
+        let mut metrics = test_metrics();
+        metrics.observe_lifeguard_multiplier(1.0);
+        metrics.observe_lifeguard_multiplier(2.0);
+        metrics.observe_lifeguard_multiplier(0.9);
+        metrics.observe_lifeguard_multiplier(f64::NAN);
+        metrics.observe_lifeguard_multiplier(f64::INFINITY);
+
+        let report = metrics.finish(ScenarioConfig::default()).report;
+        assert!((report.lifeguard_multiplier_avg - 1.5).abs() < f64::EPSILON);
+        assert!((report.lifeguard_multiplier_p95 - 2.0).abs() < f64::EPSILON);
+        assert!((report.lifeguard_multiplier_max - 2.0).abs() < f64::EPSILON);
     }
 }

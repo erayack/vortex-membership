@@ -12,6 +12,12 @@ pub struct RunReport {
     pub false_suspicions: u64,
     pub convergence_ms: u64,
     pub owner_churn_per_min: f64,
+    pub ownership_pending_total: u64,
+    pub ownership_cancelled_total: u64,
+    pub ownership_confirmed_total: u64,
+    pub lifeguard_multiplier_avg: f64,
+    pub lifeguard_multiplier_p95: f64,
+    pub lifeguard_multiplier_max: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,6 +26,7 @@ pub struct RunArtifact {
     pub report: RunReport,
     pub false_suspicion_rate: f64,
     pub detection_samples_ms: Vec<u64>,
+    pub lifeguard_multiplier_samples: Vec<f64>,
 }
 
 impl RunArtifact {
@@ -105,6 +112,31 @@ pub fn percentile(samples: &[u64], pct: f64) -> u64 {
     sorted[last_idx]
 }
 
+#[must_use]
+pub fn percentile_f64(samples: &[f64], pct: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let bounded = pct.clamp(0.0, 1.0);
+    let last_idx = sorted.len() - 1;
+    let denominator = u32::try_from(last_idx)
+        .map_or(u32::MAX, |value| value)
+        .max(1);
+
+    for (idx, _) in sorted.iter().enumerate().take(last_idx + 1) {
+        let numerator = u32::try_from(idx).map_or(u32::MAX, |value| value);
+        if f64::from(numerator) / f64::from(denominator) >= bounded {
+            return sorted[idx];
+        }
+    }
+
+    sorted[last_idx]
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,6 +169,12 @@ mod tests {
             false_suspicions: 1,
             convergence_ms: 30,
             owner_churn_per_min: 2.5,
+            ownership_pending_total: 4,
+            ownership_cancelled_total: 2,
+            ownership_confirmed_total: 1,
+            lifeguard_multiplier_avg: 1.0,
+            lifeguard_multiplier_p95: 1.0,
+            lifeguard_multiplier_max: 1.0,
         };
         let write_result = write_run_report(&out, &report);
         assert!(write_result.is_ok());

@@ -7,7 +7,9 @@ use vortex_membership::dissemination::Disseminator;
 use vortex_membership::failure_detector::FailureDetector;
 use vortex_membership::harness::run_scenario;
 use vortex_membership::node::NodeRuntime;
-use vortex_membership::ownership::OwnershipResolver;
+use vortex_membership::ownership::{
+    OwnershipResolver, StickyOwnershipConfig, StickyOwnershipResolver,
+};
 use vortex_membership::report::write_run_report;
 use vortex_membership::state::MembershipStore;
 use vortex_membership::transport::UdpTransport;
@@ -81,7 +83,19 @@ async fn run_node_mode(config_path: &std::path::Path) -> Result<(), AppError> {
             app_config.swim.suspect_timeout_ms,
         ),
         Disseminator::with_retransmit_multiplier(1, app_config.swim.retransmit_multiplier),
-        OwnershipResolver::default(),
+        StickyOwnershipResolver::new(
+            OwnershipResolver::default(),
+            StickyOwnershipConfig::new(
+                app_config.swim.ownership_stability_window_ms,
+                app_config.swim.ownership_max_tracked_keys,
+                app_config.swim.ownership_fast_cutover_on_terminal,
+            ),
+        ),
+    )
+    .with_observer_buffer(app_config.swim.observer_buffer)
+    .with_lifeguard(
+        app_config.swim.lifeguard_enabled,
+        app_config.swim.lifeguard_max_multiplier,
     );
 
     info!(
@@ -89,6 +103,8 @@ async fn run_node_mode(config_path: &std::path::Path) -> Result<(), AppError> {
         node_id = %app_config.node.node_id,
         bound_addr = %app_config.node.bind_addr,
         quarantine_ms = app_config.swim.quarantine_ms,
+        lifeguard_enabled = app_config.swim.lifeguard_enabled,
+        lifeguard_max_multiplier = app_config.swim.lifeguard_max_multiplier,
         "starting node mode runtime"
     );
 
@@ -115,6 +131,9 @@ async fn run_lab_mode(
         false_suspicions = report.false_suspicions,
         convergence_ms = report.convergence_ms,
         owner_churn_per_min = report.owner_churn_per_min,
+        lifeguard_multiplier_avg = report.lifeguard_multiplier_avg,
+        lifeguard_multiplier_p95 = report.lifeguard_multiplier_p95,
+        lifeguard_multiplier_max = report.lifeguard_multiplier_max,
         "completed lab scenario"
     );
     Ok(())
