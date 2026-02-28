@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::state::{ApplyResult, MembershipStore};
-use crate::types::{MemberDigest, MembershipUpdate};
+use crate::types::{MemberDigest, MembershipUpdate, UpdateVersion};
 
 #[derive(Clone, Debug, Default)]
 pub struct AntiEntropy;
@@ -19,18 +19,18 @@ impl AntiEntropy {
     ) -> Vec<MembershipUpdate> {
         let remote_by_id: HashMap<_, _> = remote
             .iter()
-            .map(|digest| (digest.node_id.clone(), digest.incarnation))
+            .map(|digest| (digest.node_id.clone(), UpdateVersion::from(digest)))
             .collect();
 
         let local_node_id = store.local_node_id().clone();
         let mut updates = Vec::new();
 
         for member in store.snapshot_members() {
-            let remote_incarnation = remote_by_id.get(&member.node_id).copied().unwrap_or(0);
-            // Digest-only comparison cannot detect status/timestamp divergence
-            // within the same incarnation, so we also ship equal-incarnation
-            // entries as a convergence backstop.
-            if member.incarnation < remote_incarnation {
+            let local_version = UpdateVersion::from(&member);
+            if remote_by_id
+                .get(&member.node_id)
+                .is_some_and(|remote_version| local_version <= *remote_version)
+            {
                 continue;
             }
 
@@ -132,26 +132,20 @@ mod tests {
             MemberDigest {
                 node_id: NodeId::from("local"),
                 incarnation: 0,
+                status: MemberStatus::Alive,
+                last_changed_ms: 0,
             },
             MemberDigest {
                 node_id: NodeId::from("node-a"),
                 incarnation: 2,
+                status: MemberStatus::Alive,
+                last_changed_ms: 2,
             },
         ];
 
         let delta = AntiEntropy::diff_for_remote(&store, &remote);
 
-        assert_eq!(delta.len(), 3);
-        assert!(
-            delta
-                .iter()
-                .any(|entry| entry.node_id == NodeId::from("local"))
-        );
-        assert!(
-            delta
-                .iter()
-                .any(|entry| entry.node_id == NodeId::from("node-a"))
-        );
+        assert_eq!(delta.len(), 1);
         assert!(
             delta
                 .iter()
@@ -160,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_for_remote_includes_same_incarnation_for_convergence() {
+    fn diff_for_remote_excludes_equal_versions() {
         let mut store = MembershipStore::new(NodeId::from("local"), addr(9_000), 1_000);
         let _ = store.apply_update(update("node-a", 2), 10);
 
@@ -168,12 +162,37 @@ mod tests {
             MemberDigest {
                 node_id: NodeId::from("local"),
                 incarnation: 0,
+                status: MemberStatus::Alive,
+                last_changed_ms: 0,
             },
             MemberDigest {
                 node_id: NodeId::from("node-a"),
                 incarnation: 2,
+                status: MemberStatus::Alive,
+                last_changed_ms: 2,
             },
         ];
+
+        let delta = AntiEntropy::diff_for_remote(&store, &remote);
+
+        assert!(
+            !delta
+                .iter()
+                .any(|entry| entry.node_id == NodeId::from("node-a"))
+        );
+    }
+
+    #[test]
+    fn diff_for_remote_includes_status_or_timestamp_tiebreak_newer() {
+        let mut store = MembershipStore::new(NodeId::from("local"), addr(9_000), 1_000);
+        let _ = store.apply_update(update("node-a", 2), 10);
+
+        let remote = vec![MemberDigest {
+            node_id: NodeId::from("node-a"),
+            incarnation: 2,
+            status: MemberStatus::Alive,
+            last_changed_ms: 1,
+        }];
 
         let delta = AntiEntropy::diff_for_remote(&store, &remote);
 

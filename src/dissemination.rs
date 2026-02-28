@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use bincode::config;
 
 use crate::protocol::WireMessage;
 use crate::transport::MAX_PACKET_SIZE;
-use crate::types::MembershipUpdate;
+use crate::types::{MembershipUpdate, NodeId, UpdateVersion};
 
 const DEFAULT_RETRANSMIT_CONSTANT: usize = 1;
 const DEFAULT_RETRANSMIT_MULTIPLIER: f64 = 4.0;
@@ -18,6 +18,7 @@ struct QueuedUpdate {
 #[derive(Clone, Debug)]
 pub struct Disseminator {
     queue: VecDeque<QueuedUpdate>,
+    peer_known: HashMap<NodeId, HashMap<NodeId, UpdateVersion>>,
     cluster_size: usize,
     retransmit_constant: usize,
     retransmit_multiplier: f64,
@@ -26,9 +27,10 @@ pub struct Disseminator {
 
 impl Disseminator {
     #[must_use]
-    pub const fn new(cluster_size: usize) -> Self {
+    pub fn new(cluster_size: usize) -> Self {
         Self {
             queue: VecDeque::new(),
+            peer_known: HashMap::new(),
             cluster_size,
             retransmit_constant: DEFAULT_RETRANSMIT_CONSTANT,
             retransmit_multiplier: DEFAULT_RETRANSMIT_MULTIPLIER,
@@ -66,6 +68,22 @@ impl Disseminator {
     }
 
     pub fn next_piggyback_batch(&mut self, max_items: usize) -> Vec<MembershipUpdate> {
+        self.next_piggyback_batch_internal(max_items, None)
+    }
+
+    fn next_piggyback_batch_for(
+        &mut self,
+        peer: &NodeId,
+        max_items: usize,
+    ) -> Vec<MembershipUpdate> {
+        self.next_piggyback_batch_internal(max_items, Some(peer))
+    }
+
+    fn next_piggyback_batch_internal(
+        &mut self,
+        max_items: usize,
+        peer: Option<&NodeId>,
+    ) -> Vec<MembershipUpdate> {
         let mut batch = Vec::new();
         let mut remaining_budget = self.remaining_budget_bytes.min(MAX_PACKET_SIZE);
 
@@ -82,6 +100,11 @@ impl Disseminator {
             };
 
             scanned += 1;
+
+            if peer.is_some_and(|peer_id| !self.peer_needs_update(peer_id, &entry.update)) {
+                self.queue.push_back(entry);
+                continue;
+            }
 
             let encoded_len = encoded_update_len(&entry.update);
             if encoded_len > remaining_budget {
@@ -101,6 +124,13 @@ impl Disseminator {
         batch
     }
 
+    fn peer_needs_update(&self, peer: &NodeId, update: &MembershipUpdate) -> bool {
+        self.peer_known
+            .get(peer)
+            .and_then(|known_by_member| known_by_member.get(&update.node_id))
+            .is_none_or(|known| update.version() > *known)
+    }
+
     pub const fn set_cluster_size(&mut self, cluster_size: usize) {
         self.cluster_size = cluster_size;
     }
@@ -110,7 +140,7 @@ impl Disseminator {
     }
 
     #[must_use]
-    pub fn attach_to_message(&mut self, message: WireMessage) -> WireMessage {
+    pub fn attach_to_message_for(&mut self, peer: &NodeId, message: WireMessage) -> WireMessage {
         let base_size = bincode::serde::encode_to_vec(&message, config::standard())
             .ok()
             .map_or(MAX_PACKET_SIZE, |bytes| bytes.len());
@@ -126,23 +156,51 @@ impl Disseminator {
                 seq,
                 from,
                 piggyback,
-            } => WireMessage::ping(seq, from, self.extend_piggyback(piggyback)),
+            } => WireMessage::ping(seq, from, self.extend_piggyback_for(peer, piggyback)),
             WireMessage::Ack {
                 seq,
                 from,
                 piggyback,
-            } => WireMessage::ack(seq, from, self.extend_piggyback(piggyback)),
+            } => WireMessage::ack(seq, from, self.extend_piggyback_for(peer, piggyback)),
             WireMessage::PingReq {
                 seq,
                 from,
                 target,
                 piggyback,
-            } => WireMessage::ping_req(seq, from, target, self.extend_piggyback(piggyback)),
+            } => WireMessage::ping_req(
+                seq,
+                from,
+                target,
+                self.extend_piggyback_for(peer, piggyback),
+            ),
             _ => message,
         }
     }
 
-    fn extend_piggyback(&mut self, mut existing: Vec<MembershipUpdate>) -> Vec<MembershipUpdate> {
+    pub fn note_peer_observation(&mut self, peer: &NodeId, observed_updates: &[MembershipUpdate]) {
+        if observed_updates.is_empty() {
+            return;
+        }
+
+        let known_by_member = self.peer_known.entry(peer.clone()).or_default();
+        for update in observed_updates {
+            let observed_version = update.version();
+            known_by_member
+                .entry(update.node_id.clone())
+                .and_modify(|known| {
+                    if observed_version > *known {
+                        *known = observed_version;
+                    }
+                })
+                .or_insert(observed_version);
+        }
+    }
+
+    fn extend_piggyback_for(
+        &mut self,
+        peer: &NodeId,
+        mut existing: Vec<MembershipUpdate>,
+    ) -> Vec<MembershipUpdate> {
         let max_updates = crate::protocol::MAX_PIGGYBACK_UPDATES;
         let remaining_slots = max_updates.saturating_sub(existing.len());
         if remaining_slots == 0 {
@@ -150,7 +208,7 @@ impl Disseminator {
             return existing;
         }
 
-        let mut fresh = self.next_piggyback_batch(remaining_slots);
+        let mut fresh = self.next_piggyback_batch_for(peer, remaining_slots);
         existing.append(&mut fresh);
         existing.truncate(max_updates);
         existing
@@ -273,8 +331,9 @@ mod tests {
         let mut disseminator = Disseminator::new(8);
         disseminator.enqueue(update("node-a", 1));
 
+        let peer = NodeId::from("peer-a");
         let message = WireMessage::ping(1, NodeId::from("self"), Vec::new());
-        let message = disseminator.attach_to_message(message);
+        let message = disseminator.attach_to_message_for(&peer, message);
 
         match message {
             WireMessage::Ping { piggyback, .. } => assert_eq!(piggyback.len(), 1),
@@ -287,9 +346,10 @@ mod tests {
         let mut disseminator = Disseminator::new(8);
         disseminator.enqueue(update("node-b", 1));
 
+        let peer = NodeId::from("peer-a");
         let existing = vec![update("node-a", 1)];
         let message = WireMessage::ping(1, NodeId::from("self"), existing);
-        let message = disseminator.attach_to_message(message);
+        let message = disseminator.attach_to_message_for(&peer, message);
 
         match message {
             WireMessage::Ping { piggyback, .. } => {
@@ -304,6 +364,31 @@ mod tests {
                         .any(|entry| entry.node_id == NodeId::from("node-b"))
                 );
             }
+            _ => panic!("expected ping"),
+        }
+    }
+
+    #[test]
+    fn attach_to_message_for_skips_updates_observed_from_peer() {
+        let mut disseminator = Disseminator::new(8);
+        let update = update("node-a", 1);
+        disseminator.enqueue(update.clone());
+
+        let peer_a = NodeId::from("peer-a");
+        let peer_b = NodeId::from("peer-b");
+        disseminator.note_peer_observation(&peer_a, &[update]);
+
+        let msg_for_a = WireMessage::ping(1, NodeId::from("self"), Vec::new());
+        let msg_for_a = disseminator.attach_to_message_for(&peer_a, msg_for_a);
+        match msg_for_a {
+            WireMessage::Ping { piggyback, .. } => assert!(piggyback.is_empty()),
+            _ => panic!("expected ping"),
+        }
+
+        let msg_for_b = WireMessage::ping(2, NodeId::from("self"), Vec::new());
+        let msg_for_b = disseminator.attach_to_message_for(&peer_b, msg_for_b);
+        match msg_for_b {
+            WireMessage::Ping { piggyback, .. } => assert_eq!(piggyback.len(), 1),
             _ => panic!("expected ping"),
         }
     }
