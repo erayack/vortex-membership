@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::types::{MemberRecord, MemberStatus, NodeId};
 
+const MAX_LOCAL_HEALTH_MULTIPLIER: f64 = 10.0;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DetectorAction {
     SendPing {
@@ -21,16 +23,16 @@ pub enum DetectorAction {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct PendingProbe {
     target: NodeId,
-    direct_deadline_ms: u64,
-    indirect_deadline_ms: Option<u64>,
+    direct_started_ms: u64,
+    indirect_started_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct SuspectTimer {
-    deadline_ms: u64,
+    started_ms: u64,
     seq: u64,
 }
 
@@ -38,9 +40,10 @@ struct SuspectTimer {
 pub struct FailureDetector {
     local_node_id: NodeId,
     probe_interval_ms: u64,
-    ack_timeout_ms: u64,
+    base_ack_timeout_ms: u64,
     indirect_ping_count: usize,
-    suspect_timeout_ms: u64,
+    base_suspect_timeout_ms: u64,
+    local_health_multiplier: f64,
     next_probe_due_ms: Option<u64>,
     next_seq: u64,
     probe_cursor: usize,
@@ -61,9 +64,10 @@ impl FailureDetector {
         Self {
             local_node_id,
             probe_interval_ms,
-            ack_timeout_ms,
+            base_ack_timeout_ms: ack_timeout_ms,
             indirect_ping_count,
-            suspect_timeout_ms,
+            base_suspect_timeout_ms: suspect_timeout_ms,
+            local_health_multiplier: 1.0,
             next_probe_due_ms: None,
             next_seq: 1,
             probe_cursor: 0,
@@ -71,6 +75,35 @@ impl FailureDetector {
             suspect_deadlines: BTreeMap::new(),
             last_view: Vec::new(),
         }
+    }
+
+    pub const fn set_local_health_multiplier(&mut self, multiplier: f64) {
+        self.local_health_multiplier = clamp_local_health_multiplier(multiplier);
+    }
+
+    #[must_use]
+    pub const fn local_health_multiplier(&self) -> f64 {
+        self.local_health_multiplier
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn effective_ack_timeout_ms(&self) -> u64 {
+        let scaled = (self.base_ack_timeout_ms as f64 * self.local_health_multiplier) as u64;
+        scaled.max(self.base_ack_timeout_ms)
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn effective_suspect_timeout_ms(&self) -> u64 {
+        let scaled = (self.base_suspect_timeout_ms as f64 * self.local_health_multiplier) as u64;
+        scaled.max(self.base_suspect_timeout_ms)
     }
 
     pub fn on_tick(&mut self, view: &[MemberRecord], now_ms: u64) -> Vec<DetectorAction> {
@@ -93,8 +126,8 @@ impl FailureDetector {
             seq,
             PendingProbe {
                 target: target.clone(),
-                direct_deadline_ms: now_ms.saturating_add(self.ack_timeout_ms),
-                indirect_deadline_ms: None,
+                direct_started_ms: now_ms,
+                indirect_started_ms: None,
             },
         );
 
@@ -126,11 +159,14 @@ impl FailureDetector {
         let mut actions = Vec::new();
         let mut to_remove = Vec::new();
 
+        let ack_timeout = self.effective_ack_timeout_ms();
+
         let direct_timeouts: Vec<_> = self
             .pending_probes
             .iter()
             .filter(|(_, pending)| {
-                pending.indirect_deadline_ms.is_none() && now_ms >= pending.direct_deadline_ms
+                pending.indirect_started_ms.is_none()
+                    && now_ms >= pending.direct_started_ms.saturating_add(ack_timeout)
             })
             .map(|(seq, pending)| (*seq, pending.target.clone()))
             .collect();
@@ -154,7 +190,7 @@ impl FailureDetector {
             }
 
             if let Some(pending) = self.pending_probes.get_mut(&seq) {
-                pending.indirect_deadline_ms = Some(now_ms.saturating_add(self.ack_timeout_ms));
+                pending.indirect_started_ms = Some(now_ms);
             }
         }
 
@@ -162,8 +198,8 @@ impl FailureDetector {
             .pending_probes
             .iter()
             .filter_map(|(seq, pending)| {
-                pending.indirect_deadline_ms.and_then(|deadline| {
-                    if now_ms >= deadline {
+                pending.indirect_started_ms.and_then(|started| {
+                    if now_ms >= started.saturating_add(ack_timeout) {
                         Some((*seq, pending.target.clone()))
                     } else {
                         None
@@ -185,9 +221,10 @@ impl FailureDetector {
             self.pending_probes.remove(&seq);
         }
 
+        let suspect_timeout = self.effective_suspect_timeout_ms();
         let mut dead_nodes = Vec::new();
         for (node_id, timer) in &self.suspect_deadlines {
-            if now_ms >= timer.deadline_ms {
+            if now_ms >= timer.started_ms.saturating_add(suspect_timeout) {
                 dead_nodes.push(node_id.clone());
             }
         }
@@ -256,7 +293,7 @@ impl FailureDetector {
         self.suspect_deadlines.insert(
             target,
             SuspectTimer {
-                deadline_ms: now_ms.saturating_add(self.suspect_timeout_ms),
+                started_ms: now_ms,
                 seq,
             },
         );
@@ -284,6 +321,14 @@ impl FailureDetector {
             .retain(|_, pending| reachable.contains(&pending.target));
         self.suspect_deadlines
             .retain(|node_id, _| suspects.contains(node_id));
+    }
+}
+
+const fn clamp_local_health_multiplier(multiplier: f64) -> f64 {
+    if multiplier.is_finite() {
+        multiplier.clamp(1.0, MAX_LOCAL_HEALTH_MULTIPLIER)
+    } else {
+        1.0
     }
 }
 
@@ -442,5 +487,66 @@ mod tests {
                 target: NodeId::from("node-a")
             }]
         );
+    }
+
+    #[test]
+    fn health_multiplier_extends_timeouts_dynamically() {
+        let mut detector = FailureDetector::new(NodeId::from("self"), 100, 20, 1, 80);
+        let view = vec![
+            member("self", MemberStatus::Alive),
+            member("node-a", MemberStatus::Alive),
+        ];
+
+        let _ = detector.on_tick(&view, 0);
+
+        // With multiplier=1.0, ack timeout is 20ms, so at t=20 direct times out.
+        // Raise multiplier to 2.0 before that fires → effective ack timeout = 40ms.
+        detector.set_local_health_multiplier(2.0);
+        assert!((detector.local_health_multiplier() - 2.0).abs() < f64::EPSILON);
+
+        // At t=20 the probe should NOT have timed out yet (effective timeout = 40).
+        let actions = detector.on_timeout(20);
+        assert!(actions.is_empty());
+
+        // At t=40 it should now fire the indirect phase.
+        let actions = detector.on_timeout(40);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, DetectorAction::MarkSuspect { .. }))
+        );
+
+        // Suspect timer also uses multiplier: base=80 * 2.0 = 160ms from t=40.
+        let dead_too_early = detector.on_timeout(180);
+        assert!(dead_too_early.is_empty());
+
+        let dead = detector.on_timeout(200);
+        assert_eq!(
+            dead,
+            vec![DetectorAction::MarkDead {
+                target: NodeId::from("node-a")
+            }]
+        );
+    }
+
+    #[test]
+    fn multiplier_below_one_clamps_to_one() {
+        let mut detector = FailureDetector::new(NodeId::from("self"), 100, 20, 1, 80);
+        detector.set_local_health_multiplier(0.5);
+        assert!((detector.local_health_multiplier() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn multiplier_above_max_or_non_finite_is_bounded() {
+        let mut detector = FailureDetector::new(NodeId::from("self"), 100, 20, 1, 80);
+
+        detector.set_local_health_multiplier(1_000.0);
+        assert!((detector.local_health_multiplier() - 10.0).abs() < f64::EPSILON);
+
+        detector.set_local_health_multiplier(f64::INFINITY);
+        assert!((detector.local_health_multiplier() - 1.0).abs() < f64::EPSILON);
+
+        detector.set_local_health_multiplier(f64::NAN);
+        assert!((detector.local_health_multiplier() - 1.0).abs() < f64::EPSILON);
     }
 }
