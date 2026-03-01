@@ -1,5 +1,7 @@
-use std::collections::HashMap;
 use std::hash::Hasher;
+use std::num::NonZeroUsize;
+
+use lru::LruCache;
 
 use twox_hash::XxHash64;
 
@@ -125,14 +127,13 @@ struct TrackedKeyState {
     stable_owner: Option<NodeId>,
     candidate_owner: Option<NodeId>,
     candidate_since_ms: Option<u64>,
-    last_access_ms: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct StickyOwnershipResolver {
     base: OwnershipResolver,
     config: StickyOwnershipConfig,
-    tracked_keys: HashMap<u64, TrackedKeyState>,
+    tracked_keys: LruCache<u64, TrackedKeyState>,
 }
 
 impl StickyOwnershipResolver {
@@ -141,10 +142,11 @@ impl StickyOwnershipResolver {
         if config.max_tracked_keys == 0 {
             config.max_tracked_keys = 1;
         }
+        let cap = NonZeroUsize::new(config.max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
         Self {
             base,
             config,
-            tracked_keys: HashMap::new(),
+            tracked_keys: LruCache::new(cap),
         }
     }
 
@@ -161,7 +163,6 @@ impl StickyOwnershipResolver {
 
         let Some(candidate_owner) = candidate_owner else {
             if let Some(state) = self.tracked_keys.get_mut(&key_hash) {
-                state.last_access_ms = now_ms;
                 clear_pending(state);
             }
             return StickyDecision::NoRoute;
@@ -169,19 +170,15 @@ impl StickyOwnershipResolver {
 
         let state = self
             .tracked_keys
-            .entry(key_hash)
-            .or_insert_with(|| TrackedKeyState {
+            .get_or_insert_mut(key_hash, || TrackedKeyState {
                 stable_owner: Some(candidate_owner.clone()),
                 candidate_owner: None,
                 candidate_since_ms: None,
-                last_access_ms: now_ms,
             });
-        state.last_access_ms = now_ms;
 
         let Some(stable_owner) = state.stable_owner.clone() else {
             state.stable_owner = Some(candidate_owner.clone());
             clear_pending(state);
-            self.enforce_capacity();
             return StickyDecision::Stable {
                 owner: candidate_owner,
             };
@@ -189,7 +186,6 @@ impl StickyOwnershipResolver {
 
         if stable_owner == candidate_owner {
             clear_pending(state);
-            self.enforce_capacity();
             return StickyDecision::Stable {
                 owner: stable_owner,
             };
@@ -202,7 +198,6 @@ impl StickyOwnershipResolver {
         ) {
             state.stable_owner = Some(candidate_owner.clone());
             clear_pending(state);
-            self.enforce_capacity();
             return StickyDecision::Stable {
                 owner: candidate_owner,
             };
@@ -224,31 +219,15 @@ impl StickyOwnershipResolver {
         if now_ms.saturating_sub(pending_since_ms) >= self.config.stability_window_ms {
             state.stable_owner = Some(candidate_owner.clone());
             clear_pending(state);
-            self.enforce_capacity();
             return StickyDecision::Stable {
                 owner: candidate_owner,
             };
         }
 
-        self.enforce_capacity();
         StickyDecision::Pending {
             stable_owner,
             candidate_owner,
             pending_since_ms,
-        }
-    }
-
-    fn enforce_capacity(&mut self) {
-        while self.tracked_keys.len() > self.config.max_tracked_keys {
-            let Some(oldest_key) = self
-                .tracked_keys
-                .iter()
-                .min_by_key(|(_, state)| state.last_access_ms)
-                .map(|(key, _)| *key)
-            else {
-                break;
-            };
-            self.tracked_keys.remove(&oldest_key);
         }
     }
 }

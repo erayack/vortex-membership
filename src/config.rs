@@ -241,9 +241,8 @@ fn validate_swim(path: &Path, swim: &SwimConfig) -> Result<(), ConfigError> {
     if swim.observer_buffer == 0 {
         return Err(invalid(path, "`observer_buffer` must be > 0"));
     }
-    if swim.ownership_stability_window_ms == 0 {
-        return Err(invalid(path, "`ownership_stability_window_ms` must be > 0"));
-    }
+    // ownership_stability_window_ms = 0 is valid: it disables the stability
+    // window, enabling immediate rendezvous routing (see plan §6).
     if swim.ownership_max_tracked_keys == 0 {
         return Err(invalid(path, "`ownership_max_tracked_keys` must be > 0"));
     }
@@ -452,18 +451,14 @@ anti_entropy_interval_ms = 5000
     }
 
     #[test]
-    fn validate_swim_rejects_zero_ownership_stability_window() {
+    fn validate_swim_accepts_zero_ownership_stability_window() {
         let path = Path::new("scenario.toml");
         let swim = SwimConfig {
             ownership_stability_window_ms: 0,
             ..SwimConfig::default()
         };
 
-        assert!(matches!(
-            validate_swim(path, &swim),
-            Err(ConfigError::Invalid { message, .. })
-                if message == "`ownership_stability_window_ms` must be > 0"
-        ));
+        assert!(validate_swim(path, &swim).is_ok());
     }
 
     #[test]

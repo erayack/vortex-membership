@@ -56,6 +56,7 @@ pub enum MembershipEventKind {
     Dead,
     Left,
     Recovered,
+    Refutation,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

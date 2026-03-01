@@ -1,10 +1,10 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bincode::config;
 
 use crate::protocol::WireMessage;
 use crate::transport::MAX_PACKET_SIZE;
-use crate::types::{MembershipUpdate, NodeId, UpdateVersion};
+use crate::types::{MemberRecord, MembershipUpdate, NodeId, UpdateVersion};
 
 const DEFAULT_RETRANSMIT_CONSTANT: usize = 1;
 const DEFAULT_RETRANSMIT_MULTIPLIER: f64 = 4.0;
@@ -196,6 +196,19 @@ impl Disseminator {
         }
     }
 
+    pub fn prune_peer_known(&mut self, view: &[MemberRecord]) {
+        let known_node_ids: HashSet<&NodeId> = view.iter().map(|member| &member.node_id).collect();
+
+        self.peer_known.retain(|peer_id, known_by_member| {
+            if !known_node_ids.contains(peer_id) {
+                return false;
+            }
+
+            known_by_member.retain(|member_id, _| known_node_ids.contains(member_id));
+            true
+        });
+    }
+
     fn extend_piggyback_for(
         &mut self,
         peer: &NodeId,
@@ -255,7 +268,7 @@ mod tests {
 
     use super::Disseminator;
     use crate::protocol::WireMessage;
-    use crate::types::{MemberStatus, MembershipUpdate, NodeId};
+    use crate::types::{MemberRecord, MemberStatus, MembershipUpdate, NodeId};
 
     fn update(node_id: &str, incarnation: u64) -> MembershipUpdate {
         MembershipUpdate {
@@ -266,6 +279,16 @@ mod tests {
             last_changed_ms: incarnation,
             origin_node_id: NodeId::from(node_id),
             source_node_id: NodeId::from(node_id),
+        }
+    }
+
+    fn member(node_id: &str) -> MemberRecord {
+        MemberRecord {
+            node_id: NodeId::from(node_id),
+            addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7000)),
+            incarnation: 1,
+            status: MemberStatus::Alive,
+            last_changed_ms: 1,
         }
     }
 
@@ -391,5 +414,34 @@ mod tests {
             WireMessage::Ping { piggyback, .. } => assert_eq!(piggyback.len(), 1),
             _ => panic!("expected ping"),
         }
+    }
+
+    #[test]
+    fn prune_peer_known_removes_entries_not_in_view() {
+        let mut disseminator = Disseminator::new(8);
+        let node_a = update("node-a", 1);
+        let node_b = update("node-b", 1);
+        let peer_a = NodeId::from("peer-a");
+        let peer_spoofed = NodeId::from("peer-spoofed");
+
+        disseminator.note_peer_observation(&peer_a, &[node_a.clone(), node_b]);
+        disseminator.note_peer_observation(&peer_spoofed, &[node_a]);
+
+        disseminator.prune_peer_known(&[member("peer-a"), member("node-a")]);
+
+        assert!(!disseminator.peer_known.contains_key(&peer_spoofed));
+        assert!(disseminator.peer_known.contains_key(&peer_a));
+        assert!(
+            disseminator
+                .peer_known
+                .get(&peer_a)
+                .is_some_and(|known| known.contains_key(&NodeId::from("node-a")))
+        );
+        assert!(
+            disseminator
+                .peer_known
+                .get(&peer_a)
+                .is_some_and(|known| !known.contains_key(&NodeId::from("node-b")))
+        );
     }
 }

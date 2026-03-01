@@ -566,7 +566,7 @@ impl NodeRuntime {
             ApplyResult::Applied { transition, .. } => {
                 self.emit_membership_event(transition, now_ms);
                 self.disseminator.enqueue(update);
-                self.sync_disseminator_cluster_size();
+                self.sync_disseminator_membership_view();
             }
             ApplyResult::RequiresRefutation(node_id) if node_id == self.local_node_id => {
                 let (refutation, result) = self
@@ -575,7 +575,7 @@ impl NodeRuntime {
                 if let ApplyResult::Applied { transition, .. } = result {
                     self.emit_membership_event(transition, now_ms);
                     self.disseminator.enqueue(refutation);
-                    self.sync_disseminator_cluster_size();
+                    self.sync_disseminator_membership_view();
                 }
             }
             ApplyResult::IgnoredStale | ApplyResult::RequiresRefutation(_) => {}
@@ -608,9 +608,11 @@ impl NodeRuntime {
         });
     }
 
-    fn sync_disseminator_cluster_size(&mut self) {
-        let alive_count = self.store.snapshot_alive().len().max(1);
+    fn sync_disseminator_membership_view(&mut self) {
+        let alive_members = self.store.snapshot_alive();
+        let alive_count = alive_members.len().max(1);
         self.disseminator.set_cluster_size(alive_count);
+        self.disseminator.prune_peer_known(&alive_members);
     }
 }
 
@@ -619,7 +621,7 @@ const fn classify_membership_event_kind(
     current_status: MemberStatus,
 ) -> Option<MembershipEventKind> {
     match (previous_status, current_status) {
-        (None, MemberStatus::Alive) => Some(MembershipEventKind::Join),
+        (Some(MemberStatus::Left) | None, MemberStatus::Alive) => Some(MembershipEventKind::Join),
         (Some(MemberStatus::Alive) | None, MemberStatus::Suspect) => {
             Some(MembershipEventKind::Suspect)
         }
@@ -630,6 +632,7 @@ const fn classify_membership_event_kind(
         (Some(MemberStatus::Suspect | MemberStatus::Dead), MemberStatus::Alive) => {
             Some(MembershipEventKind::Recovered)
         }
+        (Some(MemberStatus::Alive), MemberStatus::Alive) => Some(MembershipEventKind::Refutation),
         _ => None,
     }
 }
@@ -647,5 +650,59 @@ const fn sanitize_lifeguard_max_multiplier(multiplier: f64) -> f64 {
         multiplier.clamp(1.0, MAX_LIFEGUARD_MULTIPLIER)
     } else {
         1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MembershipEventKind;
+
+    #[test]
+    fn classify_none_to_alive_is_join() {
+        assert_eq!(
+            classify_membership_event_kind(None, MemberStatus::Alive),
+            Some(MembershipEventKind::Join),
+        );
+    }
+
+    #[test]
+    fn classify_left_to_alive_is_join() {
+        assert_eq!(
+            classify_membership_event_kind(Some(MemberStatus::Left), MemberStatus::Alive),
+            Some(MembershipEventKind::Join),
+        );
+    }
+
+    #[test]
+    fn classify_suspect_to_alive_is_recovered() {
+        assert_eq!(
+            classify_membership_event_kind(Some(MemberStatus::Suspect), MemberStatus::Alive),
+            Some(MembershipEventKind::Recovered),
+        );
+    }
+
+    #[test]
+    fn classify_dead_to_alive_is_recovered() {
+        assert_eq!(
+            classify_membership_event_kind(Some(MemberStatus::Dead), MemberStatus::Alive),
+            Some(MembershipEventKind::Recovered),
+        );
+    }
+
+    #[test]
+    fn classify_alive_to_alive_is_refutation() {
+        assert_eq!(
+            classify_membership_event_kind(Some(MemberStatus::Alive), MemberStatus::Alive),
+            Some(MembershipEventKind::Refutation),
+        );
+    }
+
+    #[test]
+    fn classify_any_to_left() {
+        assert_eq!(
+            classify_membership_event_kind(Some(MemberStatus::Alive), MemberStatus::Left),
+            Some(MembershipEventKind::Left),
+        );
     }
 }
